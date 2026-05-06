@@ -1,0 +1,2 @@
+# No Python package dependencies.
+# The launcher uses tkinter from the Python standard library.
