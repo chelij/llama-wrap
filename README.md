@@ -44,40 +44,6 @@ There are no third-party Python package dependencies.
 python llamawrap.py
 ```
 
-## Release Builds
-
-Release bundles can be built with PyInstaller. The bundled app includes Python and the launcher UI, but it does not include `llama-server`, models, CUDA, Metal, Vulkan, or other llama.cpp runtime files.
-
-Install the build dependency:
-
-```bash
-python -m pip install -r requirements-build.txt
-```
-
-Build for the current operating system:
-
-```bash
-python scripts/build_release.py
-```
-
-The archive will be written to `dist/`.
-
-Cross-platform release artifacts are built by GitHub Actions in `.github/workflows/release.yml`:
-
-- Windows x86_64
-- macOS x86_64
-- macOS arm64
-- Linux x86_64
-
-To publish a GitHub release, push a version tag:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-Linux builds are made on Ubuntu 22.04 for broad compatibility with common desktop distributions. For older distributions, running from source may be more reliable.
-
 ## Basic Usage
 
 1. Choose a model `.gguf` file.
