@@ -40,9 +40,19 @@ There are no third-party Python package dependencies.
 
 ## Run
 
+From source:
+
 ```bash
 python llamawrap.py
 ```
+
+From a release download, extract the archive first, then run the executable for your platform:
+
+- Windows: run `llama-wrap.exe`.
+- macOS: open `llama-wrap.app` or run the packaged `llama-wrap` executable.
+- Linux: run `./llama-wrap`.
+
+The executable releases are built automatically on GitHub Actions. I can test the Linux build locally, but I cannot personally test the Windows and macOS release builds.
 
 ## Basic Usage
 
