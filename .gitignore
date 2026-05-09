@@ -8,3 +8,4 @@ dist/
 *.spec
 
 history.json
+settings.yml

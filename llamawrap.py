@@ -35,6 +35,13 @@ class FlagConfig:
     enabled: bool = True
     value_required: bool = True
     choices: tuple[str, ...] = ()
+    inferers: tuple[str, ...] = ()
+    custom: bool = False
+
+
+@dataclass
+class InfererConfig:
+    executable: str
 
 
 @dataclass
@@ -320,7 +327,9 @@ class LauncherApp:
         self.model_meta: GGUFMetadata | None = None
         self.process: subprocess.Popen[str] | None = None
         self.selected_preset: str | None = None
+        self.inferers = self.default_inferers()
         self.flags = self.default_flags()
+        self.hidden_flags: set[str] = set()
         self.flag_vars: dict[str, dict[str, tk.Variable]] = {}
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.estimate: dict[str, float] = {}
@@ -330,6 +339,8 @@ class LauncherApp:
         self.model_loaded = False
         self.intentional_stop = False
         self.extra_args_var: tk.StringVar | None = None
+        self.inferer_var: tk.StringVar | None = None
+        self.inferer_executable_var: tk.StringVar | None = None
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -344,6 +355,19 @@ class LauncherApp:
         self.refresh_process_state()
         self.refresh_gpu_usage()
         self.drain_log_queue()
+
+    def default_inferers(self) -> dict[str, InfererConfig]:
+        return {
+            "llama.cpp": InfererConfig(
+                "llama-server",
+            ),
+            "ik_llama.cpp": InfererConfig(
+                "llama-server",
+            ),
+            "Custom": InfererConfig(
+                "llama-server",
+            ),
+        }
 
     def default_flags(self) -> dict[str, FlagConfig]:
         cpu_threads = max(1, os.cpu_count() or 1)
@@ -363,6 +387,14 @@ class LauncherApp:
             "--threads-http": FlagConfig("HTTP threads", "-1", False),
             "-a": FlagConfig("Alias", "", False),
             "-to": FlagConfig("Timeout", "600", False),
+            "--jinja": FlagConfig("Jinja tools", "", False, False),
+            "--fit": FlagConfig("Auto fit VRAM", "", False, False, (), ("ik_llama.cpp",)),
+            "--fit-margin": FlagConfig("Fit margin MiB", "1024", False, True, (), ("ik_llama.cpp",)),
+            "-mla": FlagConfig("MLA mode", "3", False, True, ("0", "1", "2", "3"), ("ik_llama.cpp",)),
+            "-fmoe": FlagConfig("Fused MoE", "", False, False, (), ("ik_llama.cpp",)),
+            "-cram": FlagConfig("RAM prompt cache", "8192", False, True, (), ("ik_llama.cpp",)),
+            "-khad": FlagConfig("K Hadamard", "", False, False, (), ("ik_llama.cpp",)),
+            "-vhad": FlagConfig("V Hadamard", "", False, False, (), ("ik_llama.cpp",)),
             "--mmproj": FlagConfig("MMProj", "", False),
         }
 
@@ -383,6 +415,14 @@ class LauncherApp:
             "--threads-http": "HTTP worker threads for serving requests. -1 lets llama.cpp choose.",
             "-a": "Model alias shown to API clients. Useful when clients expect a specific model name.",
             "-to": "Server read/write timeout in seconds.",
+            "--jinja": "Enable Jinja chat templates. Needed by some tool/function-calling clients and supported by llama.cpp-style servers.",
+            "--fit": "ik_llama.cpp only. Automatically fits as many tensors as possible into available VRAM instead of choosing a fixed layer count.",
+            "--fit-margin": "ik_llama.cpp only. Safety VRAM margin in MiB used with --fit. Increase if model loading hits CUDA out-of-memory.",
+            "-mla": "ik_llama.cpp only. MLA mode for DeepSeek-style MLA models. Leave disabled unless the model/docs recommend it.",
+            "-fmoe": "ik_llama.cpp only. Enable fused MoE kernels for mixture-of-experts models when supported by your build.",
+            "-cram": "ik_llama.cpp only. Prompt/KV cache kept in host RAM, in MiB. 0 disables, -1 removes the limit.",
+            "-khad": "ik_llama.cpp only. Hadamard transform for K cache, useful when experimenting with aggressive KV quantization.",
+            "-vhad": "ik_llama.cpp only. Hadamard transform for V cache, useful when experimenting with aggressive KV quantization.",
         }
 
     def configure_style(self) -> None:
@@ -472,7 +512,7 @@ class LauncherApp:
         Tooltip(save_button, "Save preset\n\nUpdate the selected preset, or save the current settings as a preset.")
         import_button = self.make_button(preset_actions, "📋", self.import_command_dialog, width=46, bg=self.colors["import"], hover=self.colors["import_hover"])
         import_button.grid(row=0, column=3, sticky="ew")
-        Tooltip(import_button, "Import command\n\nPaste a llama-server command and load recognized arguments into the UI.")
+        Tooltip(import_button, "Import command\n\nPaste a server command and load recognized arguments into the UI.")
 
         self.preset_list = tk.Listbox(
             left,
@@ -499,22 +539,36 @@ class LauncherApp:
         model_panel = self.make_panel(right, padx=14, pady=14)
         model_panel.grid(row=0, column=0, sticky="ew")
         model_panel.columnconfigure(1, weight=1)
-        tk.Label(model_panel, text="Model", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+        model_panel.columnconfigure(2, weight=1)
+        tk.Label(model_panel, text="Inferer", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=0, sticky="w", padx=(0, 12)
+        )
+        self.inferer_var = tk.StringVar(value="llama.cpp")
+        self.inferer_var.trace_add("write", lambda *_: self.on_inferer_changed())
+        inferer_selector = self.make_choice_selector(model_panel, self.inferer_var, tuple(self.inferers.keys()))
+        inferer_selector.grid(row=0, column=1, sticky="ew")
+        Tooltip(inferer_selector, "Inferer\n\nChoose which llama-server-compatible backend profile to use. ik_llama.cpp exposes extra ik-only tuning flags.")
+        self.inferer_executable_var = tk.StringVar(value=self.current_inferer().executable)
+        self.inferer_executable_var.trace_add("write", lambda *_: self.update_command_preview())
+        executable_entry = self.make_entry(model_panel, self.inferer_executable_var)
+        executable_entry.grid(row=0, column=2, sticky="ew", padx=(8, 0), ipady=6)
+        Tooltip(executable_entry, "Executable\n\nCommand or path to the server binary. For ik_llama.cpp this is often /path/to/ik_llama.cpp/build/bin/llama-server.")
+        tk.Label(model_panel, text="Model", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+            row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
         )
         self.model_var = tk.StringVar()
         self.model_var.trace_add("write", lambda *_: self.on_model_changed())
         self.model_entry = self.make_entry(model_panel, self.model_var)
-        self.model_entry.grid(row=0, column=1, sticky="ew", ipady=6)
-        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("model"), width=78).grid(row=0, column=2, padx=(8, 0))
+        self.model_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
+        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("model"), width=78).grid(row=1, column=3, padx=(8, 0), pady=(10, 0))
         tk.Label(model_panel, text="MMProj", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
+            row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
         )
         self.mmproj_var = tk.StringVar()
         self.mmproj_var.trace_add("write", lambda *_: self.on_mmproj_changed())
         self.mmproj_entry = self.make_entry(model_panel, self.mmproj_var)
-        self.mmproj_entry.grid(row=1, column=1, sticky="ew", pady=(10, 0), ipady=6)
-        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("mmproj"), width=78).grid(row=1, column=2, padx=(8, 0), pady=(10, 0))
+        self.mmproj_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
+        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("mmproj"), width=78).grid(row=2, column=3, padx=(8, 0), pady=(10, 0))
 
         flags_panel = self.make_panel(right, padx=14, pady=12)
         flags_panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -525,8 +579,11 @@ class LauncherApp:
         tk.Label(flags_header, text="Flags", bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 12, "bold")).grid(
             row=0, column=0, sticky="w"
         )
+        add_flag_button = self.make_button(flags_header, "➕", self.add_flag_dialog, width=34, bg=self.colors["add"], hover=self.colors["add_hover"])
+        add_flag_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
+        Tooltip(add_flag_button, "Add flag\n\nAdd a custom server flag to the UI.")
         clear_flags_button = self.make_button(flags_header, "🧹", self.clear_flags_to_default, width=34, bg=self.colors["panel_soft"])
-        clear_flags_button.grid(row=0, column=1, sticky="e")
+        clear_flags_button.grid(row=0, column=2, sticky="e")
         Tooltip(clear_flags_button, "Clear flags\n\nUntick every flag, empty all flag values, and clear Extra args.")
         self.flags_frame = tk.Frame(flags_panel, bg=self.colors["panel"])
         self.flags_frame.grid(row=1, column=0, sticky="ew")
@@ -544,7 +601,7 @@ class LauncherApp:
         extra_entry.grid(row=0, column=1, sticky="ew", ipady=6)
         Tooltip(
             extra_entry,
-            "Extra llama-server arguments\n\nUse this for advanced or less common flags that are not shown in the UI, for example --no-webui, --metrics, --jinja, --log-file server.log, or --tensor-split 3,1.",
+            "Extra server arguments\n\nUse this for advanced or less common flags that are not shown in the UI, for example --no-webui, --metrics, --log-file server.log, -cuda graphs=0, or --tensor-split 3,1.",
         )
 
         controls = tk.Frame(right, bg=self.colors["bg"])
@@ -552,10 +609,10 @@ class LauncherApp:
         controls.columnconfigure(5, weight=1)
         launch_button = self.make_button(controls, "▶", self.launch, width=52, bg=self.colors["good"], hover=self.colors["good_hover"])
         launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-        Tooltip(launch_button, "Launch\n\nStart llama-server with the current settings.")
+        Tooltip(launch_button, "Launch\n\nStart the selected inferer with the current settings.")
         stop_button = self.make_button(controls, "■", self.stop_process, width=52, bg=self.colors["danger"], hover=self.colors["danger_hover"])
         stop_button.grid(row=0, column=1, sticky="ew", padx=(0, 8))
-        Tooltip(stop_button, "Stop\n\nStop the running llama-server process.")
+        Tooltip(stop_button, "Stop\n\nStop the running inferer process.")
         clear_button = self.make_button(controls, "🧹", self.clear_logs, width=52, bg=self.colors["panel_soft"])
         clear_button.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         Tooltip(clear_button, "Clear output\n\nClear the output log.")
@@ -575,7 +632,7 @@ class LauncherApp:
             font=("TkDefaultFont", 13, "bold"),
         )
         auto_restart.grid(row=0, column=3, sticky="w")
-        Tooltip(auto_restart, "Auto-restart\n\nRestart llama-server automatically if it crashes. Manual Stop will not restart it.")
+        Tooltip(auto_restart, "Auto-restart\n\nRestart the selected inferer automatically if it crashes. Manual Stop will not restart it.")
         self.command_var = tk.StringVar()
         self.command_label = tk.Label(
             controls,
@@ -745,17 +802,140 @@ class LauncherApp:
         button.bind("<Leave>", lambda _event: button.configure(bg=base))
         return button
 
+    def current_inferer_key(self) -> str:
+        if self.inferer_var is None:
+            return "llama.cpp"
+        key = self.inferer_var.get()
+        return key if key in self.inferers else "llama.cpp"
+
+    def current_inferer(self) -> InfererConfig:
+        return self.inferers[self.current_inferer_key()]
+
+    def flag_supported_by_current_inferer(self, flag: str) -> bool:
+        if flag in self.hidden_flags:
+            return False
+        cfg = self.flags.get(flag)
+        if cfg is None or not cfg.inferers:
+            return True
+        return self.current_inferer_key() in cfg.inferers
+
+    def on_inferer_changed(self) -> None:
+        inferer = self.current_inferer()
+        if self.inferer_executable_var and not self.inferer_executable_var.get().strip():
+            self.inferer_executable_var.set(inferer.executable)
+        self.render_flags()
+        self.update_command_preview()
+
+    def normalize_custom_flag(self, flag: str) -> str:
+        return flag.strip()
+
+    def add_or_update_flag(self, flag: str, value: str = "", value_required: bool = True, enabled: bool = True) -> None:
+        normalized = self.normalize_custom_flag(flag)
+        if not normalized.startswith("-") or normalized == "-":
+            raise ValueError("Flag must start with - or --.")
+        if any(char.isspace() for char in normalized):
+            raise ValueError("Flag name cannot contain spaces.")
+        if normalized in {"-m", "--model"}:
+            raise ValueError("Use the Model field for the model path.")
+        if normalized in {"--mmproj", "-mm"}:
+            raise ValueError("Use the MMProj field for the projector path.")
+        existing = self.flags.get(normalized)
+        if existing:
+            existing.value = value
+            existing.value_required = value_required
+            existing.enabled = enabled
+            self.hidden_flags.discard(normalized)
+        else:
+            label = normalized.lstrip("-") or normalized
+            self.flags[normalized] = FlagConfig(label, value, enabled, value_required, custom=True)
+
+    def add_flag_dialog(self) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add flag")
+        dialog.configure(bg=self.colors["bg"])
+        dialog.geometry("460x220")
+        dialog.minsize(420, 210)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        shell = tk.Frame(dialog, bg=self.colors["bg"], padx=14, pady=14)
+        shell.pack(fill="both", expand=True)
+        shell.columnconfigure(1, weight=1)
+
+        tk.Label(shell, text="Flag", bg=self.colors["bg"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10)
+        )
+        flag_var = tk.StringVar()
+        flag_entry = self.make_entry(shell, flag_var)
+        flag_entry.grid(row=0, column=1, sticky="ew", pady=(0, 10), ipady=6)
+
+        tk.Label(shell, text="Value", bg=self.colors["bg"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+            row=1, column=0, sticky="w", padx=(0, 12), pady=(0, 10)
+        )
+        value_var = tk.StringVar()
+        value_entry = self.make_entry(shell, value_var)
+        value_entry.grid(row=1, column=1, sticky="ew", pady=(0, 10), ipady=6)
+
+        needs_value_var = tk.BooleanVar(value=True)
+        needs_value = tk.Checkbutton(
+            shell,
+            text="takes a value",
+            variable=needs_value_var,
+            bg=self.colors["bg"],
+            fg=self.colors["text"],
+            activebackground=self.colors["bg"],
+            activeforeground=self.colors["text"],
+            selectcolor=self.colors["field"],
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        needs_value.grid(row=2, column=1, sticky="w")
+
+        actions = tk.Frame(shell, bg=self.colors["bg"])
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        actions.columnconfigure(0, weight=1)
+
+        def save() -> None:
+            try:
+                self.add_or_update_flag(flag_var.get(), value_var.get().strip(), needs_value_var.get(), True)
+            except ValueError as exc:
+                messagebox.showerror("Cannot add flag", str(exc), parent=dialog)
+                return
+            dialog.destroy()
+            self.render_flags()
+            self.recalculate_vram()
+
+        self.make_button(actions, "Add", save, width=76, bg=self.colors["add"], hover=self.colors["add_hover"]).grid(row=0, column=1, padx=(0, 8))
+        self.make_button(actions, "Cancel", dialog.destroy, width=76, bg=self.colors["panel_soft"]).grid(row=0, column=2)
+        flag_entry.focus_set()
+
+    def remove_flag(self, flag: str) -> None:
+        if flag == "--mmproj":
+            return
+        cfg = self.flags.get(flag)
+        if not cfg:
+            return
+        if cfg.custom:
+            del self.flags[flag]
+        else:
+            self.hidden_flags.add(flag)
+            cfg.enabled = False
+        self.render_flags()
+        self.recalculate_vram()
+
     def render_flags(self) -> None:
         for child in self.flags_frame.winfo_children():
             child.destroy()
         self.flag_vars.clear()
-        items = [(flag, cfg) for flag, cfg in self.flags.items() if flag != "--mmproj"]
+        items = [(flag, cfg) for flag, cfg in self.flags.items() if flag != "--mmproj" and self.flag_supported_by_current_inferer(flag)]
         help_text = self.flag_help()
         for idx, (flag, cfg) in enumerate(items):
             row, col = divmod(idx, 3)
             cell = tk.Frame(self.flags_frame, bg=self.colors["panel"])
             cell.grid(row=row, column=col, sticky="ew", padx=(0, 14) if col < 2 else (0, 0), pady=5)
             cell.columnconfigure(1, weight=1)
+            cell.columnconfigure(2, minsize=26)
             enabled_var = tk.BooleanVar(value=cfg.enabled)
             check = tk.Checkbutton(
                 cell,
@@ -820,6 +1000,9 @@ class LauncherApp:
                 )
                 label.grid(row=0, column=1, sticky="w")
                 Tooltip(label, f"{flag} - {cfg.label}\n\n{help_text.get(flag, '')}")
+            remove = self.make_button(cell, "×", lambda f=flag: self.remove_flag(f), width=22, bg=self.colors["panel_soft"])
+            remove.grid(row=0, column=2, sticky="e", padx=(6, 0))
+            Tooltip(remove, f"Remove {flag}\n\nHide this flag from the current UI. Add it again with the plus button.")
             self.flag_vars[flag] = values
 
     def clear_flags_to_default(self) -> None:
@@ -851,21 +1034,30 @@ class LauncherApp:
 
     def add_preset(self) -> None:
         self.selected_preset = None
-        self.save_current_preset(force_name_prompt=True)
+        self.save_current_preset()
 
-    def save_current_preset(self, force_name_prompt: bool = False) -> None:
+    def save_current_preset(self) -> None:
         default = self.selected_preset or (Path(self.model_var.get()).stem if self.model_var.get() else "")
-        name = default
-        if force_name_prompt or not name:
-            name = simpledialog.askstring("Save preset", "Preset name:", initialvalue=default, parent=self.root)
+        name = simpledialog.askstring("Save preset", "Preset name:", initialvalue=default, parent=self.root)
         if not name:
             return
         preset = {
             "preset_name": name.strip(),
+            "inferer": self.current_inferer_key(),
+            "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
             "model_path": self.model_var.get().strip(),
             "mmproj_path": self.flags["--mmproj"].value,
             "extra_args": self.extra_args_var.get().strip() if self.extra_args_var else "",
-            "flags": {flag: {"value": cfg.value, "enabled": cfg.enabled} for flag, cfg in self.flags.items()},
+            "hidden_flags": sorted(self.hidden_flags),
+            "flags": {
+                flag: {
+                    "value": cfg.value,
+                    "enabled": cfg.enabled,
+                    "value_required": cfg.value_required,
+                    "custom": cfg.custom,
+                }
+                for flag, cfg in self.flags.items()
+            },
         }
         self.history.upsert_preset(preset)
         self.selected_preset = name.strip()
@@ -873,7 +1065,7 @@ class LauncherApp:
 
     def import_command_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
-        dialog.title("Import llama-server command")
+        dialog.title("Import server command")
         dialog.configure(bg=self.colors["bg"])
         dialog.geometry("760x360")
         dialog.minsize(560, 280)
@@ -887,7 +1079,7 @@ class LauncherApp:
 
         tk.Label(
             shell,
-            text="Paste llama-server command",
+            text="Paste server command",
             bg=self.colors["bg"],
             fg=self.colors["text"],
             font=("TkDefaultFont", 12, "bold"),
@@ -931,14 +1123,22 @@ class LauncherApp:
 
     def import_command(self, command_text: str) -> tuple[int, list[str]]:
         if not command_text.strip():
-            raise ValueError("Paste a llama-server command first.")
+            raise ValueError("Paste a server command first.")
         try:
             tokens = shlex.split(command_text)
         except ValueError as exc:
             raise ValueError(f"Could not read the command: {exc}") from exc
         if not tokens:
-            raise ValueError("Paste a llama-server command first.")
-        if Path(tokens[0]).name == "llama-server":
+            raise ValueError("Paste a server command first.")
+        if tokens[0] and not tokens[0].startswith("-"):
+            executable = tokens[0]
+            exe_name = Path(executable).name
+            if self.inferer_executable_var:
+                self.inferer_executable_var.set(executable)
+            if "ik_llama" in executable.lower():
+                self.inferer_var.set("ik_llama.cpp")
+            elif exe_name == "llama-server" and self.inferer_var and self.inferer_var.get() not in self.inferers:
+                self.inferer_var.set("llama.cpp")
             tokens = tokens[1:]
 
         alias_to_flag = {
@@ -974,7 +1174,21 @@ class LauncherApp:
             "-to": "-to",
             "--mmproj": "--mmproj",
             "-mm": "--mmproj",
+            "--jinja": "--jinja",
+            "--fit": "--fit",
+            "--fit-margin": "--fit-margin",
+            "-mla": "-mla",
+            "--mla-use": "-mla",
+            "-fmoe": "-fmoe",
+            "--fused-moe": "-fmoe",
+            "-cram": "-cram",
+            "--cache-ram": "-cram",
+            "-khad": "-khad",
+            "--k-cache-hadamard": "-khad",
+            "-vhad": "-vhad",
+            "--v-cache-hadamard": "-vhad",
         }
+        valueless_flags = {flag for flag, cfg in self.flags.items() if not cfg.value_required}
         changed = 0
         skipped: list[str] = []
         extra_tokens: list[str] = []
@@ -992,22 +1206,35 @@ class LauncherApp:
                 changed += 1
             elif token in alias_to_flag:
                 flag = alias_to_flag[token]
-                value, idx = self.consume_import_value(tokens, idx, inline_value, token)
+                if flag in valueless_flags:
+                    value = inline_value or ""
+                else:
+                    value, idx = self.consume_import_value(tokens, idx, inline_value, token)
                 if flag == "--mmproj":
                     self.mmproj_var.set(value)
                 elif flag in self.flags:
                     self.flags[flag].value = value
                     self.flags[flag].enabled = True
+                    self.hidden_flags.discard(flag)
                 else:
                     skipped.append(token)
                     extra_tokens.extend([token, value])
                 changed += 1
             elif token.startswith("-"):
-                skipped.append(token)
-                extra_tokens.append(token if inline_value is None else f"{token}={inline_value}")
+                value = inline_value or ""
+                value_required = inline_value is not None
                 if inline_value is None and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
                     idx += 1
-                    extra_tokens.append(tokens[idx])
+                    value = tokens[idx]
+                    value_required = True
+                try:
+                    self.add_or_update_flag(token, value, value_required, True)
+                    changed += 1
+                except ValueError:
+                    skipped.append(token)
+                    extra_tokens.append(token if inline_value is None else f"{token}={inline_value}")
+                    if value_required and value:
+                        extra_tokens.append(value)
             idx += 1
 
         if extra_tokens and self.extra_args_var:
@@ -1034,11 +1261,29 @@ class LauncherApp:
 
     def load_preset(self, preset: dict[str, Any]) -> None:
         self.selected_preset = preset.get("preset_name")
+        self.flags = self.default_flags()
+        self.hidden_flags = set()
         saved_flags = preset.get("flags", {})
+        for flag, saved in saved_flags.items():
+            if flag not in self.flags and bool(saved.get("custom", False)):
+                self.flags[flag] = FlagConfig(
+                    flag.lstrip("-") or flag,
+                    str(saved.get("value", "") or ""),
+                    bool(saved.get("enabled", True)),
+                    bool(saved.get("value_required", True)),
+                    custom=True,
+                )
         for flag, cfg in self.flags.items():
             saved = saved_flags.get(flag, {})
             cfg.value = str(saved.get("value", cfg.value) or "")
             cfg.enabled = bool(saved.get("enabled", cfg.enabled))
+            cfg.value_required = bool(saved.get("value_required", cfg.value_required))
+        self.hidden_flags = {str(flag) for flag in preset.get("hidden_flags", []) if str(flag) in self.flags}
+        inferer = str(preset.get("inferer") or "llama.cpp")
+        if self.inferer_var:
+            self.inferer_var.set(inferer if inferer in self.inferers else "llama.cpp")
+        if self.inferer_executable_var:
+            self.inferer_executable_var.set(str(preset.get("inferer_executable") or self.current_inferer().executable))
         self.model_var.set(str(preset.get("model_path") or saved_flags.get("-m", {}).get("value") or ""))
         self.mmproj_var.set(str(preset.get("mmproj_path") or saved_flags.get("--mmproj", {}).get("value") or ""))
         if self.extra_args_var:
@@ -1362,19 +1607,22 @@ class LauncherApp:
             raise ValueError("model path is required")
         if validate_model and not Path(model_path).expanduser().exists():
             raise ValueError("model path does not exist")
-        command = ["llama-server", "-m", model_path]
+        executable = self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable
+        if not executable:
+            raise ValueError("inferer executable is required")
+        try:
+            command = shlex.split(executable)
+        except ValueError as exc:
+            raise ValueError(f"inferer executable is not valid shell-style text: {exc}") from exc
+        if not command:
+            raise ValueError("inferer executable is required")
+        command.extend(["-m", model_path])
         for flag, cfg in self.flags.items():
             if not cfg.enabled:
                 continue
-            if flag == "--mmproj" and not cfg.value.strip():
+            if not self.flag_supported_by_current_inferer(flag):
                 continue
-            if flag == "--webui":
-                if str(cfg.value).strip().lower() == "off":
-                    command.append("--no-webui")
-                elif cfg.value_required:
-                    command.append("--webui")
-                else:
-                    command.append(flag)
+            if flag == "--mmproj" and not cfg.value.strip():
                 continue
             if cfg.value_required:
                 if cfg.value.strip():
@@ -1394,8 +1642,10 @@ class LauncherApp:
         except Exception as exc:
             messagebox.showerror("Cannot launch", str(exc))
             return
-        if not shutil.which(command[0]):
-            messagebox.showerror("Cannot launch", "llama-server was not found in PATH.")
+        executable = command[0]
+        executable_exists = Path(executable).expanduser().exists() if any(sep in executable for sep in ("/", "\\")) else bool(shutil.which(executable))
+        if not executable_exists:
+            messagebox.showerror("Cannot launch", f"{executable} was not found. Check the inferer executable field.")
             return
         self.intentional_stop = False
         self.clear_logs()
@@ -1405,7 +1655,7 @@ class LauncherApp:
         self.model_loaded = False
         self.kill_existing_on_port(self.get_int_flag("--port", DEFAULT_SERVER_PORT))
         if add_separator:
-            self.append_log("warn", "Auto-restarting llama-server...")
+            self.append_log("warn", "Auto-restarting inferer...")
         self.append_log("normal", f"$ {shlex.join(command)}")
         self.set_status("Launching")
         try:
@@ -1451,7 +1701,7 @@ class LauncherApp:
     def stop_process(self) -> None:
         self.intentional_stop = True
         if self.process and self.process.poll() is None:
-            self.append_log("warn", "Stopping llama-server...")
+            self.append_log("warn", "Stopping inferer...")
             try:
                 if os.name != "nt":
                     os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
@@ -1468,7 +1718,7 @@ class LauncherApp:
                 self.set_status("Stopped")
             else:
                 self.set_status("Crashed")
-                self.append_log("error", f"llama-server exited with code {code}")
+                self.append_log("error", f"inferer exited with code {code}")
                 if hasattr(self, "auto_restart_var") and self.auto_restart_var.get():
                     try:
                         command = self.build_command()
