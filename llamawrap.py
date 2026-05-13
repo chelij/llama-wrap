@@ -25,7 +25,17 @@ DEFAULT_SERVER_PORT = 8123
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 HISTORY_FILE = APP_DIR / "history.json"
 GB = 1024**3
-KV_BYTES = {"q4_0": 0.5, "q4_1": 0.5, "q5_0": 0.625, "q5_1": 0.625, "q8_0": 1.0, "f16": 2.0}
+KV_BYTES = {
+    "f32": 4.0,
+    "f16": 2.0,
+    "bf16": 2.0,
+    "q8_0": 1.0625,
+    "q5_0": 0.6875,
+    "q5_1": 0.75,
+    "q4_0": 0.5625,
+    "q4_1": 0.625,
+    "iq4_nl": 0.5625,
+}
 
 
 @dataclass
@@ -37,6 +47,7 @@ class FlagConfig:
     choices: tuple[str, ...] = ()
     inferers: tuple[str, ...] = ()
     custom: bool = False
+    step_mode: str = ""
 
 
 @dataclass
@@ -51,6 +62,8 @@ class GGUFMetadata:
     n_layers: int = 0
     n_embd: int = 0
     n_kv_heads: int = 0
+    n_embd_k_gqa: int = 0
+    n_embd_v_gqa: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -59,6 +72,7 @@ class HistoryStore:
         self.path = path
         self.presets: list[dict[str, Any]] = []
         self.runs: list[dict[str, Any]] = []
+        self.settings: dict[str, Any] = {}
         self.load()
 
     def load(self) -> None:
@@ -69,6 +83,7 @@ class HistoryStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.presets = list(data.get("presets", []))
             self.runs = list(data.get("runs", []))
+            self.settings = dict(data.get("settings", {}))
         except Exception:
             backup = self.path.with_suffix(f".corrupt-{int(time.time())}.json")
             self.path.rename(backup)
@@ -77,8 +92,12 @@ class HistoryStore:
             self.save()
 
     def save(self) -> None:
-        data = {"presets": self.presets, "runs": self.runs[-100:]}
+        data = {"presets": self.presets, "runs": self.runs[-100:], "settings": self.settings}
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    def set_setting(self, key: str, value: Any) -> None:
+        self.settings[key] = value
+        self.save()
 
     def upsert_preset(self, preset: dict[str, Any]) -> None:
         name = preset["preset_name"]
@@ -106,8 +125,8 @@ def human_bytes(size: float | int | None) -> str:
     if size is None:
         return "unknown"
     value = float(size)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if abs(value) < 1024 or unit == "TB":
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
             return f"{value:.0f} B" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} TB"
@@ -122,16 +141,16 @@ def read_gguf_value(data: bytes, offset: int, value_type: int) -> tuple[Any, int
     if offset < 0 or offset > len(data):
         raise ValueError("metadata outside scanned header")
     scalar_formats = {
-        0: "<?",
+        0: "<B",
         1: "<b",
-        2: "<B",
+        2: "<H",
         3: "<h",
-        4: "<H",
+        4: "<I",
         5: "<i",
-        6: "<I",
-        7: "<f",
-        10: "<q",
-        11: "<Q",
+        6: "<f",
+        7: "<?",
+        10: "<Q",
+        11: "<q",
         12: "<d",
     }
     if value_type == 8:
@@ -158,6 +177,52 @@ def read_gguf_value(data: bytes, offset: int, value_type: int) -> tuple[Any, int
     if offset + struct.calcsize(fmt) > len(data):
         raise ValueError("metadata value extends past scanned header")
     return struct.unpack_from(fmt, data, offset)[0], offset + struct.calcsize(fmt)
+
+
+def skip_gguf_value(data: bytes, offset: int, value_type: int) -> int:
+    scalar_sizes = {
+        0: 1,
+        1: 1,
+        2: 2,
+        3: 2,
+        4: 4,
+        5: 4,
+        6: 4,
+        7: 1,
+        10: 8,
+        11: 8,
+        12: 8,
+    }
+    if value_type == 8:
+        if offset + 8 > len(data):
+            raise ValueError("metadata string extends past scanned header")
+        length = struct.unpack_from("<Q", data, offset)[0]
+        offset += 8 + length
+        if offset > len(data):
+            raise ValueError("metadata string extends past scanned header")
+        return offset
+    if value_type == 9:
+        if offset + 12 > len(data):
+            raise ValueError("metadata array extends past scanned header")
+        item_type = struct.unpack_from("<I", data, offset)[0]
+        count = struct.unpack_from("<Q", data, offset + 4)[0]
+        offset += 12
+        item_size = scalar_sizes.get(item_type)
+        if item_size is not None:
+            offset += count * item_size
+            if offset > len(data):
+                raise ValueError("metadata array extends past scanned header")
+            return offset
+        for _ in range(count):
+            offset = skip_gguf_value(data, offset, item_type)
+        return offset
+    size = scalar_sizes.get(value_type)
+    if size is None:
+        raise ValueError("metadata format is newer than this launcher understands")
+    offset += size
+    if offset > len(data):
+        raise ValueError("metadata value extends past scanned header")
+    return offset
 
 
 def parse_gguf(path: str) -> GGUFMetadata:
@@ -187,14 +252,41 @@ def parse_gguf(path: str) -> GGUFMetadata:
                 raise ValueError("metadata type extends past scanned header")
             value_type = struct.unpack_from("<I", data, offset)[0]
             offset += 4
-            value, offset = read_gguf_value(data, offset, value_type)
+            is_relevant = metadata_key_matches(
+                key,
+                (
+                    "block_count",
+                    "n_layers",
+                    "n_layer",
+                    "embedding_length",
+                    "n_embd",
+                    "attention.key_length",
+                    "n_embd_head_k",
+                    "n_embd_k_gqa",
+                    "attention.value_length",
+                    "n_embd_head_v",
+                    "n_embd_v_gqa",
+                    "attention.head_count_kv",
+                    "n_head_kv",
+                    "n_kv_heads",
+                ),
+            )
+            if is_relevant:
+                value, offset = read_gguf_value(data, offset, value_type)
+            else:
+                offset = skip_gguf_value(data, offset, value_type)
+                continue
             if metadata_key_matches(key, ("block_count", "n_layers", "n_layer")):
                 meta.n_layers = int(value)
             elif metadata_key_matches(key, ("embedding_length", "n_embd")):
                 meta.n_embd = int(value)
+            elif metadata_key_matches(key, ("attention.key_length", "n_embd_head_k", "n_embd_k_gqa")):
+                meta.n_embd_k_gqa = int(value)
+            elif metadata_key_matches(key, ("attention.value_length", "n_embd_head_v", "n_embd_v_gqa")):
+                meta.n_embd_v_gqa = int(value)
             elif metadata_key_matches(key, ("attention.head_count_kv", "n_head_kv", "n_kv_heads")):
                 meta.n_kv_heads = int(value)
-            if meta.n_layers and meta.n_embd and meta.n_kv_heads:
+            if meta.n_layers and meta.n_embd and meta.n_kv_heads and meta.n_embd_k_gqa and meta.n_embd_v_gqa:
                 break
     except Exception:
         meta.warnings.append("The launcher could not read all model metadata. Launching should still work, but the VRAM estimate may be less accurate.")
@@ -325,8 +417,11 @@ class LauncherApp:
         self.history = HistoryStore(HISTORY_FILE)
         self.gpu = GPUMonitor()
         self.model_meta: GGUFMetadata | None = None
+        self.draft_model_meta: GGUFMetadata | None = None
         self.process: subprocess.Popen[str] | None = None
         self.selected_preset: str | None = None
+        self.saved_snapshot: str = ""
+        self.dirty = False
         self.inferers = self.default_inferers()
         self.flags = self.default_flags()
         self.hidden_flags: set[str] = set()
@@ -341,6 +436,10 @@ class LauncherApp:
         self.extra_args_var: tk.StringVar | None = None
         self.inferer_var: tk.StringVar | None = None
         self.inferer_executable_var: tk.StringVar | None = None
+        self.draft_model_var: tk.StringVar | None = None
+        self.tokps_var: tk.StringVar | None = None
+        self.last_tokens_per_second: float | None = None
+        self.loading_preset = False
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -348,10 +447,13 @@ class LauncherApp:
         self.root.minsize(900, 620)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.configure_style()
+        self.configure_text_shortcuts()
         self.build_ui()
         self.render_presets()
         self.render_flags()
         self.recalculate_vram()
+        self.saved_snapshot = self.snapshot_state()
+        self.dirty = False
         self.refresh_process_state()
         self.refresh_gpu_usage()
         self.drain_log_queue()
@@ -373,12 +475,12 @@ class LauncherApp:
         cpu_threads = max(1, os.cpu_count() or 1)
         return {
             "-ngl": FlagConfig("GPU layers", "auto"),
-            "-c": FlagConfig("Context size", "32768"),
+            "-c": FlagConfig("Context size", "32768", step_mode="context"),
             "-t": FlagConfig("Threads", str(cpu_threads)),
             "-tb": FlagConfig("Batch threads", "", False),
             "-fa": FlagConfig("Flash attention", "auto", True, True, ("auto", "on", "off")),
-            "-ctk": FlagConfig("KV cache K", "q4_0", True, True, ("f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1")),
-            "-ctv": FlagConfig("KV cache V", "q4_0", True, True, ("f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1")),
+            "-ctk": FlagConfig("KV cache K", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl")),
+            "-ctv": FlagConfig("KV cache V", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl")),
             "--port": FlagConfig("Port", str(DEFAULT_SERVER_PORT)),
             "--host": FlagConfig("Host", "127.0.0.1"),
             "-b": FlagConfig("Batch", "2048"),
@@ -387,6 +489,11 @@ class LauncherApp:
             "--threads-http": FlagConfig("HTTP threads", "-1", False),
             "-a": FlagConfig("Alias", "", False),
             "-to": FlagConfig("Timeout", "600", False),
+            "--spec-draft-n-max": FlagConfig("Draft tokens", "16", False, True, step_mode="power2"),
+            "--spec-draft-n-min": FlagConfig("Draft min", "0", False),
+            "--spec-draft-p-min": FlagConfig("Draft probability", "0.75", False),
+            "-cd": FlagConfig("Draft context", "2048", False, True, step_mode="context"),
+            "-ngld": FlagConfig("Draft GPU layers", "99", False),
             "--jinja": FlagConfig("Jinja tools", "", False, False),
             "--fit": FlagConfig("Auto fit VRAM", "", False, False, (), ("ik_llama.cpp",)),
             "--fit-margin": FlagConfig("Fit margin MiB", "1024", False, True, (), ("ik_llama.cpp",)),
@@ -415,6 +522,11 @@ class LauncherApp:
             "--threads-http": "HTTP worker threads for serving requests. -1 lets llama.cpp choose.",
             "-a": "Model alias shown to API clients. Useful when clients expect a specific model name.",
             "-to": "Server read/write timeout in seconds.",
+            "--spec-draft-n-max": "Speculative decoding: maximum draft tokens per verification step. Usually a power-of-two value such as 8, 16, 32, or 64.",
+            "--spec-draft-n-min": "Speculative decoding: minimum number of draft tokens before the main model verifies.",
+            "--spec-draft-p-min": "Speculative decoding: minimum probability threshold for accepting draft tokens.",
+            "-cd": "Draft model context size in tokens. Only applies when a draft model is selected.",
+            "-ngld": "GPU layers for the draft model. Use a high value for full draft offload when VRAM allows.",
             "--jinja": "Enable Jinja chat templates. Needed by some tool/function-calling clients and supported by llama.cpp-style servers.",
             "--fit": "ik_llama.cpp only. Automatically fits as many tensors as possible into available VRAM instead of choosing a fixed layer count.",
             "--fit-margin": "ik_llama.cpp only. Safety VRAM margin in MiB used with --fit. Increase if model loading hits CUDA out-of-memory.",
@@ -474,6 +586,26 @@ class LauncherApp:
             font=("TkDefaultFont", 11),
         )
 
+    def configure_text_shortcuts(self) -> None:
+        def select_all(event: tk.Event) -> str:
+            widget = event.widget
+            try:
+                if isinstance(widget, tk.Entry):
+                    widget.select_range(0, "end")
+                    widget.icursor("end")
+                elif isinstance(widget, tk.Text):
+                    widget.tag_add("sel", "1.0", "end-1c")
+                    widget.mark_set("insert", "end-1c")
+                return "break"
+            except tk.TclError:
+                return "break"
+
+        for class_name in ("Entry", "Text"):
+            self.root.bind_class(class_name, "<Control-a>", select_all)
+            self.root.bind_class(class_name, "<Control-A>", select_all)
+            for key, virtual_event in (("c", "<<Copy>>"), ("C", "<<Copy>>"), ("x", "<<Cut>>"), ("X", "<<Cut>>"), ("v", "<<Paste>>"), ("V", "<<Paste>>")):
+                self.root.bind_class(class_name, f"<Control-{key}>", lambda event, ve=virtual_event: (event.widget.event_generate(ve), "break")[1])
+
     def build_ui(self) -> None:
         top_bar = tk.Frame(self.root, bg="#090c10", height=54)
         top_bar.pack(fill="x")
@@ -530,6 +662,8 @@ class LauncherApp:
         )
         self.preset_list.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
         self.preset_list.bind("<<ListboxSelect>>", self.on_preset_selected)
+        self.preset_list.bind("<Double-Button-1>", self.load_selected_preset)
+        self.preset_list.bind("<Return>", self.load_selected_preset)
 
         right = tk.Frame(body, bg=self.colors["bg"])
         right.grid(row=0, column=1, sticky="nsew")
@@ -549,7 +683,7 @@ class LauncherApp:
         inferer_selector.grid(row=0, column=1, sticky="ew")
         Tooltip(inferer_selector, "Inferer\n\nChoose which llama-server-compatible backend profile to use. ik_llama.cpp exposes extra ik-only tuning flags.")
         self.inferer_executable_var = tk.StringVar(value=self.current_inferer().executable)
-        self.inferer_executable_var.trace_add("write", lambda *_: self.update_command_preview())
+        self.inferer_executable_var.trace_add("write", lambda *_: (self.mark_dirty(), self.update_command_preview()))
         executable_entry = self.make_entry(model_panel, self.inferer_executable_var)
         executable_entry.grid(row=0, column=2, sticky="ew", padx=(8, 0), ipady=6)
         Tooltip(executable_entry, "Executable\n\nCommand or path to the server binary. For ik_llama.cpp this is often /path/to/ik_llama.cpp/build/bin/llama-server.")
@@ -569,6 +703,15 @@ class LauncherApp:
         self.mmproj_entry = self.make_entry(model_panel, self.mmproj_var)
         self.mmproj_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
         self.make_button(model_panel, "Browse", lambda: self.open_file_picker("mmproj"), width=78).grid(row=2, column=3, padx=(8, 0), pady=(10, 0))
+        tk.Label(model_panel, text="Draft", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+            row=3, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
+        )
+        self.draft_model_var = tk.StringVar()
+        self.draft_model_var.trace_add("write", lambda *_: self.on_draft_model_changed())
+        draft_entry = self.make_entry(model_panel, self.draft_model_var)
+        draft_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
+        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("draft"), width=78).grid(row=3, column=3, padx=(8, 0), pady=(10, 0))
+        Tooltip(draft_entry, "Draft model\n\nOptional smaller GGUF model for speculative decoding. It is launched with -md/--model-draft.")
 
         flags_panel = self.make_panel(right, padx=14, pady=12)
         flags_panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -596,7 +739,7 @@ class LauncherApp:
             row=0, column=0, sticky="w", padx=(0, 12)
         )
         self.extra_args_var = tk.StringVar()
-        self.extra_args_var.trace_add("write", lambda *_: self.update_command_preview())
+        self.extra_args_var.trace_add("write", lambda *_: (self.mark_dirty(), self.update_command_preview()))
         extra_entry = self.make_entry(extra_row, self.extra_args_var)
         extra_entry.grid(row=0, column=1, sticky="ew", ipady=6)
         Tooltip(
@@ -606,7 +749,7 @@ class LauncherApp:
 
         controls = tk.Frame(right, bg=self.colors["bg"])
         controls.grid(row=2, column=0, sticky="ew", pady=(12, 10))
-        controls.columnconfigure(5, weight=1)
+        controls.columnconfigure(6, weight=1)
         launch_button = self.make_button(controls, "▶", self.launch, width=52, bg=self.colors["good"], hover=self.colors["good_hover"])
         launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         Tooltip(launch_button, "Launch\n\nStart the selected inferer with the current settings.")
@@ -616,6 +759,9 @@ class LauncherApp:
         clear_button = self.make_button(controls, "🧹", self.clear_logs, width=52, bg=self.colors["panel_soft"])
         clear_button.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         Tooltip(clear_button, "Clear output\n\nClear the output log.")
+        copy_button = self.make_button(controls, "⧉", self.copy_command, width=52, bg=self.colors["panel_soft"])
+        copy_button.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(8, 0))
+        Tooltip(copy_button, "Copy command\n\nCopy the full launch command to the clipboard.")
         self.auto_restart_var = tk.BooleanVar(value=False)
         auto_restart = tk.Checkbutton(
             controls,
@@ -644,7 +790,7 @@ class LauncherApp:
             font=("DejaVu Sans Mono", 9),
             wraplength=760,
         )
-        self.command_label.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        self.command_label.grid(row=1, column=1, columnspan=6, sticky="ew", pady=(8, 0))
 
         output_panel = self.make_panel(right, padx=14, pady=12)
         output_panel.grid(row=4, column=0, sticky="nsew")
@@ -681,7 +827,7 @@ class LauncherApp:
 
         status_panel = self.make_panel(right, padx=14, pady=12)
         status_panel.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        status_panel.columnconfigure(2, weight=1)
+        status_panel.columnconfigure(3, weight=1)
         tk.Label(status_panel, text="Status", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=0, sticky="w"
         )
@@ -696,15 +842,20 @@ class LauncherApp:
             font=("TkDefaultFont", 10, "bold"),
         )
         self.status_label.grid(row=0, column=1, sticky="w", padx=(10, 20))
+        self.tokps_var = tk.StringVar(value="")
+        tk.Label(status_panel, textvariable=self.tokps_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=2, sticky="w", padx=(0, 12)
+        )
         tk.Label(status_panel, text="VRAM", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=0, column=2, sticky="e", padx=(0, 10)
+            row=0, column=3, sticky="e", padx=(0, 10)
         )
         self.vram_label_var = tk.StringVar()
         tk.Label(status_panel, textvariable=self.vram_label_var, bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 10)).grid(
-            row=0, column=3, sticky="w"
+            row=0, column=4, sticky="w"
         )
-        self.vram_bar = ttk.Progressbar(status_panel, mode="determinate", maximum=100)
-        self.vram_bar.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.vram_bar = tk.Canvas(status_panel, height=12, bg=self.colors["field"], highlightthickness=1, highlightbackground=self.colors["border"])
+        self.vram_bar.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        self.vram_bar.bind("<Configure>", lambda _event: self.draw_vram_bar())
         self.vram_breakdown_var = tk.StringVar()
         tk.Label(
             status_panel,
@@ -714,7 +865,7 @@ class LauncherApp:
             anchor="w",
             justify="left",
             font=("DejaVu Sans Mono", 9),
-        ).grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        ).grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
 
     def make_panel(self, parent: tk.Widget, padx: int = 12, pady: int = 12) -> tk.Frame:
         return tk.Frame(parent, bg=self.colors["panel"], highlightbackground=self.colors["border"], highlightthickness=1, padx=padx, pady=pady)
@@ -742,8 +893,11 @@ class LauncherApp:
             highlightbackground=self.colors["border"],
             highlightcolor=self.colors["accent"],
             cursor="hand2",
+            height=34,
         )
+        selector.grid_propagate(False)
         selector.columnconfigure(0, weight=1)
+        selector.rowconfigure(0, weight=1)
         value_label = tk.Label(
             selector,
             textvariable=variable,
@@ -751,13 +905,12 @@ class LauncherApp:
             fg=self.colors["text"],
             anchor="w",
             padx=8,
-            pady=6,
             font=("TkDefaultFont", 11),
             cursor="hand2",
         )
-        value_label.grid(row=0, column=0, sticky="ew")
+        value_label.grid(row=0, column=0, sticky="nsew")
         arrow = tk.Label(selector, text="▾", bg=self.colors["field"], fg=self.colors["text"], padx=8, font=("TkDefaultFont", 10), cursor="hand2")
-        arrow.grid(row=0, column=1, sticky="e")
+        arrow.grid(row=0, column=1, sticky="ns")
         menu = tk.Menu(selector, tearoff=False, bg=self.colors["field"], fg=self.colors["text"], activebackground=self.colors["accent"], activeforeground="#ffffff")
         for choice in choices:
             menu.add_command(label=choice, command=lambda value=choice: variable.set(value))
@@ -823,13 +976,44 @@ class LauncherApp:
         inferer = self.current_inferer()
         if self.inferer_executable_var and not self.inferer_executable_var.get().strip():
             self.inferer_executable_var.set(inferer.executable)
+        self.mark_dirty()
         self.render_flags()
         self.update_command_preview()
+
+    def snapshot_state(self) -> str:
+        data = {
+            "inferer": self.current_inferer_key(),
+            "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else "",
+            "model_path": self.model_var.get().strip() if hasattr(self, "model_var") else "",
+            "mmproj_path": self.mmproj_var.get().strip() if hasattr(self, "mmproj_var") else "",
+            "draft_model_path": self.draft_model_var.get().strip() if self.draft_model_var else "",
+            "extra_args": self.extra_args_var.get().strip() if self.extra_args_var else "",
+            "hidden_flags": sorted(self.hidden_flags),
+            "flags": {
+                flag: {
+                    "value": cfg.value,
+                    "enabled": cfg.enabled,
+                    "value_required": cfg.value_required,
+                    "custom": cfg.custom,
+                    "step_mode": cfg.step_mode,
+                }
+                for flag, cfg in self.flags.items()
+            },
+        }
+        return json.dumps(data, sort_keys=True)
+
+    def mark_dirty(self) -> None:
+        if self.loading_preset:
+            return
+        was_dirty = self.dirty
+        self.dirty = self.snapshot_state() != self.saved_snapshot if self.selected_preset else bool(self.snapshot_state())
+        if self.dirty != was_dirty:
+            self.render_presets()
 
     def normalize_custom_flag(self, flag: str) -> str:
         return flag.strip()
 
-    def add_or_update_flag(self, flag: str, value: str = "", value_required: bool = True, enabled: bool = True) -> None:
+    def add_or_update_flag(self, flag: str, value: str = "", value_required: bool = True, enabled: bool = True, step_mode: str = "") -> None:
         normalized = self.normalize_custom_flag(flag)
         if not normalized.startswith("-") or normalized == "-":
             raise ValueError("Flag must start with - or --.")
@@ -839,22 +1023,26 @@ class LauncherApp:
             raise ValueError("Use the Model field for the model path.")
         if normalized in {"--mmproj", "-mm"}:
             raise ValueError("Use the MMProj field for the projector path.")
+        if normalized in {"-md", "--model-draft", "--spec-draft-model"}:
+            raise ValueError("Use the Draft model field for speculative decoding.")
         existing = self.flags.get(normalized)
         if existing:
             existing.value = value
             existing.value_required = value_required
             existing.enabled = enabled
+            existing.step_mode = step_mode
             self.hidden_flags.discard(normalized)
         else:
             label = normalized.lstrip("-") or normalized
-            self.flags[normalized] = FlagConfig(label, value, enabled, value_required, custom=True)
+            self.flags[normalized] = FlagConfig(label, value, enabled, value_required, custom=True, step_mode=step_mode)
+        self.mark_dirty()
 
     def add_flag_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
         dialog.title("Add flag")
         dialog.configure(bg=self.colors["bg"])
-        dialog.geometry("460x220")
-        dialog.minsize(420, 210)
+        dialog.geometry("460x250")
+        dialog.minsize(420, 240)
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -891,14 +1079,30 @@ class LauncherApp:
             highlightthickness=0,
         )
         needs_value.grid(row=2, column=1, sticky="w")
+        power2_var = tk.BooleanVar(value=False)
+        power2 = tk.Checkbutton(
+            shell,
+            text="2^n controls",
+            variable=power2_var,
+            bg=self.colors["bg"],
+            fg=self.colors["text"],
+            activebackground=self.colors["bg"],
+            activeforeground=self.colors["text"],
+            selectcolor=self.colors["field"],
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+        )
+        power2.grid(row=3, column=1, sticky="w", pady=(6, 0))
 
         actions = tk.Frame(shell, bg=self.colors["bg"])
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(16, 0))
+        actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(16, 0))
         actions.columnconfigure(0, weight=1)
 
         def save() -> None:
             try:
-                self.add_or_update_flag(flag_var.get(), value_var.get().strip(), needs_value_var.get(), True)
+                step_mode = "power2" if needs_value_var.get() and power2_var.get() else ""
+                self.add_or_update_flag(flag_var.get(), value_var.get().strip(), needs_value_var.get(), True, step_mode)
             except ValueError as exc:
                 messagebox.showerror("Cannot add flag", str(exc), parent=dialog)
                 return
@@ -921,6 +1125,7 @@ class LauncherApp:
         else:
             self.hidden_flags.add(flag)
             cfg.enabled = False
+        self.mark_dirty()
         self.render_flags()
         self.recalculate_vram()
 
@@ -964,28 +1169,33 @@ class LauncherApp:
                     entry = self.make_choice_selector(cell, value_var, cfg.choices)
                 else:
                     entry_parent = cell
-                    if flag == "-c":
+                    if cfg.step_mode:
                         entry_parent = tk.Frame(cell, bg=self.colors["panel"])
                     entry = self.make_entry(entry_parent, value_var)
                     entry.configure(width=18)
-                if flag == "-c":
-                    ctx_frame = entry_parent
-                    ctx_frame.grid(row=0, column=1, sticky="ew")
-                    ctx_frame.columnconfigure(2, weight=1)
-                    minus = self.make_button(ctx_frame, "➖", lambda: self.step_context_size(-1), width=26, bg=self.colors["panel_soft"])
+                if cfg.step_mode:
+                    control_frame = entry_parent
+                    control_frame.grid(row=0, column=1, sticky="ew")
+                    control_frame.columnconfigure(2, weight=1)
+                    minus = self.make_button(control_frame, "➖", lambda f=flag: self.step_numeric_flag(f, -1), width=26, bg=self.colors["panel_soft"])
                     minus.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-                    divide = self.make_button(ctx_frame, "/", lambda: self.scale_context_size(0.5), width=26, bg=self.colors["panel_soft"])
+                    divide = self.make_button(control_frame, "/", lambda f=flag: self.scale_numeric_flag(f, 0.5), width=26, bg=self.colors["panel_soft"])
                     divide.grid(row=0, column=1, sticky="ew", padx=(0, 4))
                     entry.grid(row=0, column=2, sticky="ew", ipady=6)
-                    multiply = self.make_button(ctx_frame, "x", lambda: self.scale_context_size(2), width=26, bg=self.colors["panel_soft"])
+                    multiply = self.make_button(control_frame, "x", lambda f=flag: self.scale_numeric_flag(f, 2), width=26, bg=self.colors["panel_soft"])
                     multiply.grid(row=0, column=3, sticky="ew", padx=(4, 0))
-                    plus = self.make_button(ctx_frame, "➕", lambda: self.step_context_size(1), width=26, bg=self.colors["panel_soft"])
+                    plus = self.make_button(control_frame, "➕", lambda f=flag: self.step_numeric_flag(f, 1), width=26, bg=self.colors["panel_soft"])
                     plus.grid(row=0, column=4, sticky="ew", padx=(4, 0))
-                    Tooltip(minus, "Decrease context size\n\nSubtract 1024 tokens.")
-                    Tooltip(divide, "Halve context size\n\nDivide the current context size by 2.")
-                    Tooltip(multiply, "Double context size\n\nMultiply the current context size by 2.")
-                    Tooltip(plus, "Increase context size\n\nAdd 1024 tokens.")
-                    Tooltip(entry, f"{flag} value\n\nShown as the final context size in tokens. -/+ change by 1024; / and x halve or double it.\n\n{help_text.get(flag, '')}")
+                    if cfg.step_mode == "power2":
+                        Tooltip(minus, "Previous 2^n value\n\nHalve the current value.")
+                        Tooltip(plus, "Next 2^n value\n\nDouble the current value.")
+                        Tooltip(entry, f"{flag} value\n\n2^n mode keeps this value on powers of two.\n\n{help_text.get(flag, '')}")
+                    else:
+                        Tooltip(minus, "Decrease value\n\nSubtract 1024.")
+                        Tooltip(plus, "Increase value\n\nAdd 1024.")
+                        Tooltip(entry, f"{flag} value\n\n-/+ change by 1024; / and x halve or double it.\n\n{help_text.get(flag, '')}")
+                    Tooltip(divide, "Halve value\n\nDivide the current value by 2.")
+                    Tooltip(multiply, "Double value\n\nMultiply the current value by 2.")
                 else:
                     entry.grid(row=0, column=1, sticky="ew", ipady=6)
                     Tooltip(entry, f"{flag} value\n\n{help_text.get(flag, '')}")
@@ -1017,7 +1227,9 @@ class LauncherApp:
     def render_presets(self) -> None:
         self.preset_list.delete(0, "end")
         for preset in self.history.presets:
-            self.preset_list.insert("end", preset.get("preset_name", "Unnamed"))
+            name = preset.get("preset_name", "Unnamed")
+            suffix = " *" if self.selected_preset == name and self.dirty else ""
+            self.preset_list.insert("end", f"{name}{suffix}")
         if self.selected_preset:
             for idx, preset in enumerate(self.history.presets):
                 if preset.get("preset_name") == self.selected_preset:
@@ -1026,6 +1238,9 @@ class LauncherApp:
                     break
 
     def on_preset_selected(self, _event: tk.Event) -> None:
+        return
+
+    def load_selected_preset(self, _event: tk.Event | None = None) -> None:
         selection = self.preset_list.curselection()
         if not selection:
             return
@@ -1034,11 +1249,13 @@ class LauncherApp:
 
     def add_preset(self) -> None:
         self.selected_preset = None
-        self.save_current_preset()
+        self.save_current_preset(force_name_prompt=True)
 
-    def save_current_preset(self) -> None:
+    def save_current_preset(self, force_name_prompt: bool = False) -> None:
         default = self.selected_preset or (Path(self.model_var.get()).stem if self.model_var.get() else "")
-        name = simpledialog.askstring("Save preset", "Preset name:", initialvalue=default, parent=self.root)
+        name = default
+        if force_name_prompt or not name:
+            name = simpledialog.askstring("Save preset", "Preset name:", initialvalue=default, parent=self.root)
         if not name:
             return
         preset = {
@@ -1047,6 +1264,7 @@ class LauncherApp:
             "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
             "model_path": self.model_var.get().strip(),
             "mmproj_path": self.flags["--mmproj"].value,
+            "draft_model_path": self.draft_model_var.get().strip() if self.draft_model_var else "",
             "extra_args": self.extra_args_var.get().strip() if self.extra_args_var else "",
             "hidden_flags": sorted(self.hidden_flags),
             "flags": {
@@ -1055,12 +1273,15 @@ class LauncherApp:
                     "enabled": cfg.enabled,
                     "value_required": cfg.value_required,
                     "custom": cfg.custom,
+                    "step_mode": cfg.step_mode,
                 }
                 for flag, cfg in self.flags.items()
             },
         }
         self.history.upsert_preset(preset)
         self.selected_preset = name.strip()
+        self.saved_snapshot = self.snapshot_state()
+        self.dirty = False
         self.render_presets()
 
     def import_command_dialog(self) -> None:
@@ -1174,6 +1395,19 @@ class LauncherApp:
             "-to": "-to",
             "--mmproj": "--mmproj",
             "-mm": "--mmproj",
+            "--spec-draft-model": "-md",
+            "--model-draft": "-md",
+            "-md": "-md",
+            "--spec-draft-n-max": "--spec-draft-n-max",
+            "--draft-max": "--spec-draft-n-max",
+            "--spec-draft-n-min": "--spec-draft-n-min",
+            "--draft-min": "--spec-draft-n-min",
+            "--spec-draft-p-min": "--spec-draft-p-min",
+            "--draft-p-min": "--spec-draft-p-min",
+            "--spec-draft-ctx-size": "-cd",
+            "--ctx-size-draft": "-cd",
+            "-cd": "-cd",
+            "-ngld": "-ngld",
             "--jinja": "--jinja",
             "--fit": "--fit",
             "--fit-margin": "--fit-margin",
@@ -1212,6 +1446,9 @@ class LauncherApp:
                     value, idx = self.consume_import_value(tokens, idx, inline_value, token)
                 if flag == "--mmproj":
                     self.mmproj_var.set(value)
+                elif flag == "-md":
+                    if self.draft_model_var:
+                        self.draft_model_var.set(value)
                 elif flag in self.flags:
                     self.flags[flag].value = value
                     self.flags[flag].enabled = True
@@ -1260,47 +1497,67 @@ class LauncherApp:
         self.render_presets()
 
     def load_preset(self, preset: dict[str, Any]) -> None:
-        self.selected_preset = preset.get("preset_name")
-        self.flags = self.default_flags()
-        self.hidden_flags = set()
-        saved_flags = preset.get("flags", {})
-        for flag, saved in saved_flags.items():
-            if flag not in self.flags and bool(saved.get("custom", False)):
-                self.flags[flag] = FlagConfig(
-                    flag.lstrip("-") or flag,
-                    str(saved.get("value", "") or ""),
-                    bool(saved.get("enabled", True)),
-                    bool(saved.get("value_required", True)),
-                    custom=True,
-                )
-        for flag, cfg in self.flags.items():
-            saved = saved_flags.get(flag, {})
-            cfg.value = str(saved.get("value", cfg.value) or "")
-            cfg.enabled = bool(saved.get("enabled", cfg.enabled))
-            cfg.value_required = bool(saved.get("value_required", cfg.value_required))
-        self.hidden_flags = {str(flag) for flag in preset.get("hidden_flags", []) if str(flag) in self.flags}
-        inferer = str(preset.get("inferer") or "llama.cpp")
-        if self.inferer_var:
-            self.inferer_var.set(inferer if inferer in self.inferers else "llama.cpp")
-        if self.inferer_executable_var:
-            self.inferer_executable_var.set(str(preset.get("inferer_executable") or self.current_inferer().executable))
-        self.model_var.set(str(preset.get("model_path") or saved_flags.get("-m", {}).get("value") or ""))
-        self.mmproj_var.set(str(preset.get("mmproj_path") or saved_flags.get("--mmproj", {}).get("value") or ""))
-        if self.extra_args_var:
-            self.extra_args_var.set(str(preset.get("extra_args") or ""))
+        self.loading_preset = True
+        try:
+            self.selected_preset = preset.get("preset_name")
+            self.flags = self.default_flags()
+            self.hidden_flags = set()
+            saved_flags = preset.get("flags", {})
+            for flag, saved in saved_flags.items():
+                if flag not in self.flags and bool(saved.get("custom", False)):
+                    self.flags[flag] = FlagConfig(
+                        flag.lstrip("-") or flag,
+                        str(saved.get("value", "") or ""),
+                        bool(saved.get("enabled", True)),
+                        bool(saved.get("value_required", True)),
+                        custom=True,
+                        step_mode=str(saved.get("step_mode", "") or ""),
+                    )
+            for flag, cfg in self.flags.items():
+                saved = saved_flags.get(flag, {})
+                cfg.value = str(saved.get("value", cfg.value) or "")
+                cfg.enabled = bool(saved.get("enabled", cfg.enabled))
+                cfg.value_required = bool(saved.get("value_required", cfg.value_required))
+                cfg.step_mode = str(saved.get("step_mode", cfg.step_mode) or "")
+            self.hidden_flags = {str(flag) for flag in preset.get("hidden_flags", []) if str(flag) in self.flags}
+            inferer = str(preset.get("inferer") or "llama.cpp")
+            if self.inferer_var:
+                self.inferer_var.set(inferer if inferer in self.inferers else "llama.cpp")
+            if self.inferer_executable_var:
+                self.inferer_executable_var.set(str(preset.get("inferer_executable") or self.current_inferer().executable))
+            self.model_var.set(str(preset.get("model_path") or saved_flags.get("-m", {}).get("value") or ""))
+            self.mmproj_var.set(str(preset.get("mmproj_path") or saved_flags.get("--mmproj", {}).get("value") or ""))
+            if self.draft_model_var:
+                self.draft_model_var.set(str(preset.get("draft_model_path") or saved_flags.get("-md", {}).get("value") or ""))
+            if self.extra_args_var:
+                self.extra_args_var.set(str(preset.get("extra_args") or ""))
+        finally:
+            self.loading_preset = False
+        self.saved_snapshot = self.snapshot_state()
+        self.dirty = False
         self.render_flags()
         self.render_presets()
         self.recalculate_vram()
 
     def open_file_picker(self, target: str) -> None:
-        start_path = self.model_var.get().strip() if target == "model" else self.flags["--mmproj"].value
-        initial_dir = Path(start_path).expanduser().parent if start_path else Path.home()
+        if target == "model":
+            start_path = self.model_var.get().strip()
+        elif target == "draft":
+            start_path = self.draft_model_var.get().strip() if self.draft_model_var else ""
+        else:
+            start_path = self.flags["--mmproj"].value
+        remembered = str(self.history.settings.get("last_gguf_dir") or "")
+        initial_dir = Path(start_path).expanduser().parent if start_path else Path(remembered).expanduser() if remembered else Path.home()
         if not initial_dir.exists():
             initial_dir = Path.home()
         result = self.choose_gguf_file(initial_dir)
         if result:
+            self.history.set_setting("last_gguf_dir", str(Path(result).expanduser().parent))
             if target == "model":
                 self.model_var.set(result)
+            elif target == "draft":
+                if self.draft_model_var:
+                    self.draft_model_var.set(result)
             else:
                 self.mmproj_var.set(result)
 
@@ -1450,6 +1707,7 @@ class LauncherApp:
         return result["path"]
 
     def on_model_changed(self) -> None:
+        self.mark_dirty()
         value = self.model_var.get().strip()
         if value and Path(value).expanduser().exists():
             self.model_meta = parse_gguf(value)
@@ -1464,36 +1722,73 @@ class LauncherApp:
         self.recalculate_vram()
 
     def on_mmproj_changed(self) -> None:
+        self.mark_dirty()
         value = self.mmproj_var.get().strip()
         self.flags["--mmproj"].value = value
         self.flags["--mmproj"].enabled = bool(value)
         self.recalculate_vram()
 
+    def on_draft_model_changed(self) -> None:
+        self.mark_dirty()
+        value = self.draft_model_var.get().strip() if self.draft_model_var else ""
+        if value and Path(value).expanduser().exists():
+            self.draft_model_meta = parse_gguf(value)
+            for warning in self.draft_model_meta.warnings:
+                self.append_log("warn", warning)
+        else:
+            self.draft_model_meta = None
+        self.recalculate_vram()
+
     def set_flag_value(self, flag: str, value: str) -> None:
         self.flags[flag].value = value
+        self.mark_dirty()
         if flag == "--mmproj" and hasattr(self, "mmproj_var") and self.mmproj_var.get() != value:
             self.mmproj_var.set(value)
         self.recalculate_vram()
 
     def set_flag_enabled(self, flag: str, enabled: bool) -> None:
         self.flags[flag].enabled = enabled
+        self.mark_dirty()
         self.recalculate_vram()
 
     def step_context_size(self, direction: int) -> None:
-        current = self.get_int_flag("-c", 0)
-        if current <= 0:
-            current = 0
-        next_value = max(1024, current + (direction * 1024))
-        self.set_context_size(next_value)
+        self.step_numeric_flag("-c", direction)
 
     def scale_context_size(self, multiplier: float) -> None:
-        current = max(1024, self.get_int_flag("-c", 1024))
-        next_value = max(1024, int(round((current * multiplier) / 1024)) * 1024)
-        self.set_context_size(next_value)
+        self.scale_numeric_flag("-c", multiplier)
 
     def set_context_size(self, value: int) -> None:
-        self.flags["-c"].value = str(value)
-        value_var = self.flag_vars.get("-c", {}).get("value")
+        self.set_numeric_flag_value("-c", value)
+
+    def step_numeric_flag(self, flag: str, direction: int) -> None:
+        cfg = self.flags.get(flag)
+        if not cfg:
+            return
+        current = self.get_int_flag(flag, 0)
+        if cfg.step_mode == "power2":
+            base = max(1, current or 1)
+            next_value = base * 2 if direction > 0 else max(1, base // 2)
+        else:
+            next_value = max(1024, max(0, current) + (direction * 1024))
+        self.set_numeric_flag_value(flag, next_value)
+
+    def scale_numeric_flag(self, flag: str, multiplier: float) -> None:
+        cfg = self.flags.get(flag)
+        if not cfg:
+            return
+        current = max(1, self.get_int_flag(flag, 1))
+        if cfg.step_mode == "power2":
+            next_value = current * 2 if multiplier >= 1 else max(1, current // 2)
+        else:
+            next_value = max(1024, int(round((current * multiplier) / 1024)) * 1024)
+        self.set_numeric_flag_value(flag, next_value)
+
+    def set_numeric_flag_value(self, flag: str, value: int) -> None:
+        if flag not in self.flags:
+            return
+        self.flags[flag].value = str(value)
+        self.mark_dirty()
+        value_var = self.flag_vars.get(flag, {}).get("value")
         if isinstance(value_var, tk.StringVar):
             value_var.set(str(value))
         else:
@@ -1525,8 +1820,10 @@ class LauncherApp:
     def estimate_confidence(self) -> str:
         if not self.model_meta:
             return "no model selected"
-        if self.model_meta.n_layers and self.model_meta.n_embd and self.model_meta.n_kv_heads:
+        if self.model_meta.n_layers and self.model_meta.n_embd_k_gqa and self.model_meta.n_embd_v_gqa:
             return "full metadata"
+        if self.model_meta.n_layers and self.model_meta.n_embd and self.model_meta.n_kv_heads:
+            return "partial metadata"
         return "file-size only"
 
     def recalculate_vram(self) -> None:
@@ -1540,23 +1837,42 @@ class LauncherApp:
         n_kv_heads = meta.n_kv_heads if meta and meta.n_kv_heads else 1
         ctk_value = self.flags["-ctk"].value or "q4_0"
         ctv_value = self.flags["-ctv"].value or ctk_value
-        kv_bytes = max(KV_BYTES.get(ctk_value, 0.5), KV_BYTES.get(ctv_value, 0.5))
-        kv_cache = context * 2 * (n_layers + 1) * (n_embd / max(1, n_kv_heads)) * kv_bytes if n_embd else 0
+        k_bytes = KV_BYTES.get(ctk_value, 0.5)
+        v_bytes = KV_BYTES.get(ctv_value, 0.5)
+        k_dim = meta.n_embd_k_gqa if meta and meta.n_embd_k_gqa else 0
+        v_dim = meta.n_embd_v_gqa if meta and meta.n_embd_v_gqa else 0
+        if k_dim and v_dim:
+            kv_cache = context * n_layers * ((k_dim * k_bytes) + (v_dim * v_bytes))
+        elif n_embd:
+            fallback_dim = n_embd / max(1, n_kv_heads)
+            kv_cache = context * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
+        else:
+            fallback_dim = 128.0
+            k_dim = int(fallback_dim)
+            v_dim = int(fallback_dim)
+            kv_cache = context * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
         mmproj_size = 0.0
         mmproj_path = self.flags["--mmproj"].value
         if self.flags["--mmproj"].enabled and mmproj_path and Path(mmproj_path).expanduser().exists():
             mmproj_size = float(Path(mmproj_path).expanduser().stat().st_size)
+        draft_size = float(self.draft_model_meta.size) if self.draft_model_meta else 0.0
         weights = (min(ngl, total_layers) / total_layers) * model_size
-        overhead = 1.25 * GB
-        estimated = weights + mmproj_size + kv_cache + overhead if model_size else 0.0
+        overhead = 0.0
+        if model_size:
+            overhead = (1.0 * GB) + (weights * 0.08) + (kv_cache * 0.05)
+        estimated = weights + draft_size + mmproj_size + kv_cache + overhead if model_size else 0.0
         self.estimate = {
             "weights": weights,
             "kv": kv_cache,
             "mmproj": mmproj_size,
+            "draft": draft_size,
             "overhead": overhead,
             "estimated": estimated,
             "ngl": float(ngl),
             "total_layers": float(total_layers),
+            "context": float(context),
+            "k_dim": float(k_dim),
+            "v_dim": float(v_dim),
         }
         self.update_command_preview()
         self.update_vram_ui()
@@ -1568,12 +1884,23 @@ class LauncherApp:
         except Exception as exc:
             self.command_var.set(f"Command incomplete: {exc}")
 
+    def copy_command(self) -> None:
+        try:
+            command_text = shlex.join(self.build_command(validate_model=False))
+        except Exception as exc:
+            messagebox.showerror("Cannot copy command", str(exc))
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(command_text)
+        self.root.update()
+        self.command_var.set(command_text)
+
     def update_vram_ui(self) -> None:
         process_running = self.process is not None and self.process.poll() is None
         used = self.vram_used if process_running and self.vram_used is not None else self.estimate.get("estimated", 0.0)
         total = self.vram_total
         percent = min(100.0, (used / total) * 100) if used and total else 0.0
-        self.vram_bar.configure(value=percent)
+        self.draw_vram_bar(percent)
         prefix = "Runtime" if process_running and self.vram_used is not None else "Estimated"
         bits = [f"{prefix} {human_bytes(used)}"]
         if total:
@@ -1581,6 +1908,36 @@ class LauncherApp:
         bits.append(f"({self.vram_source})")
         self.vram_label_var.set(" ".join(bits))
         self.update_vram_breakdown()
+
+    def draw_vram_bar(self, percent: float | None = None) -> None:
+        if not hasattr(self, "vram_bar"):
+            return
+        canvas = self.vram_bar
+        canvas.delete("all")
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        total = self.vram_total or self.estimate.get("estimated", 0.0)
+        if not total:
+            return
+        segments = [
+            ("weights", "#58a6ff"),
+            ("kv", "#f2cc60"),
+            ("draft", "#a371f7"),
+            ("mmproj", "#3fb950"),
+            ("overhead", "#ff7b72"),
+        ]
+        x = 0.0
+        for key, color in segments:
+            size = max(0.0, float(self.estimate.get(key, 0.0)))
+            segment_width = (size / total) * width
+            if segment_width <= 0:
+                continue
+            x2 = min(width, x + segment_width)
+            canvas.create_rectangle(x, 0, x2, height, fill=color, outline="")
+            x = x2
+        if percent is not None and percent > 0:
+            used_width = min(width, (percent / 100.0) * width)
+            canvas.create_line(used_width, 0, used_width, height, fill="#ffffff", width=2)
 
     def update_vram_breakdown(self) -> None:
         if not hasattr(self, "vram_breakdown_var"):
@@ -1590,15 +1947,17 @@ class LauncherApp:
         confidence = self.estimate_confidence()
         layer_text = self.describe_gpu_layers_for_estimate(total_layers, ngl) if total_layers else "no model layers available"
         parts = [
-            f"Weights {human_bytes(self.estimate.get('weights', 0.0))}",
-            f"KV {human_bytes(self.estimate.get('kv', 0.0))}",
+            f"Model {human_bytes(self.estimate.get('weights', 0.0))}",
+            f"Context/KV {human_bytes(self.estimate.get('kv', 0.0))}",
+            f"Draft {human_bytes(self.estimate.get('draft', 0.0))}",
             f"MMProj {human_bytes(self.estimate.get('mmproj', 0.0))}",
             f"Overhead {human_bytes(self.estimate.get('overhead', 0.0))}",
         ]
         self.vram_breakdown_var.set(
-            " + ".join(parts)
+            "Model blue + Context yellow + Draft purple + MMProj green + Overhead red\n"
+            + " + ".join(parts)
             + f" = {human_bytes(self.estimate.get('estimated', 0.0))}\n"
-            + f"-ngl: {layer_text} | confidence: {confidence}"
+            + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {confidence}"
         )
 
     def build_command(self, validate_model: bool = True) -> list[str]:
@@ -1617,6 +1976,11 @@ class LauncherApp:
         if not command:
             raise ValueError("inferer executable is required")
         command.extend(["-m", model_path])
+        draft_model_path = self.draft_model_var.get().strip() if self.draft_model_var else ""
+        if draft_model_path:
+            if validate_model and not Path(draft_model_path).expanduser().exists():
+                raise ValueError("draft model path does not exist")
+            command.extend(["-md", draft_model_path])
         for flag, cfg in self.flags.items():
             if not cfg.enabled:
                 continue
@@ -1757,11 +2121,15 @@ class LauncherApp:
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
+        self.last_tokens_per_second = None
+        if self.tokps_var:
+            self.tokps_var.set("")
 
     def append_log(self, level: str, text: str) -> None:
         if threading.current_thread() is not threading.main_thread():
             self.log_queue.put((level, text))
             return
+        self.capture_tokens_per_second(text)
         self.update_status_from_log(text)
         self.output.configure(state="normal")
         self.output.insert("end", text + "\n", level)
@@ -1775,6 +2143,17 @@ class LauncherApp:
             self.model_loaded = True
             if self.process and self.process.poll() is None:
                 self.set_status("Running")
+
+    def capture_tokens_per_second(self, text: str) -> None:
+        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/s|tok/s|t/s)", text, re.IGNORECASE)
+        if not match:
+            return
+        try:
+            self.last_tokens_per_second = float(match.group(1))
+        except ValueError:
+            return
+        if self.tokps_var:
+            self.tokps_var.set(f"{self.last_tokens_per_second:.2f} tok/s")
 
     def drain_log_queue(self) -> None:
         while True:
