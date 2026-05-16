@@ -86,10 +86,13 @@ Custom flags pasted from a command are added as editable flag rows when possible
 
 The `Draft` field adds `-md` / `--model-draft` for speculative decoding. This uses a smaller model beside the main model to propose tokens that the main model verifies.
 
+For MTP/self-speculative models, enable `--spec-type` and use `draft-mtp` for current llama.cpp builds. Some older MTP branches used `mtp`, so the launcher keeps both values selectable.
+
 Example:
 
 ```bash
 llama-server -m /models/large.gguf -md /models/small-draft.gguf --spec-draft-n-max 16
+llama-server -m /models/mtp.gguf --spec-type draft-mtp --spec-draft-n-max 3
 ```
 
 ## Inferers
