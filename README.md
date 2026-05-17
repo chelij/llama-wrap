@@ -103,6 +103,8 @@ The inferer selector controls the executable and which optional flags are shown.
 - `ik_llama.cpp` shows common flags plus ik-specific options such as `--fit`, `--fit-margin`, `-mla`, `-fmoe`, `-cram`, `-khad`, and `-vhad`.
 - `Custom` is for other llama-server-compatible executables. Put unsupported or unusual flags in `Extra args`.
 
+When `--fit` is enabled for `ik_llama.cpp`, the launcher does not emit `-ngl`; fit mode chooses GPU layer placement itself.
+
 `ik_llama.cpp` still builds a `llama-server` binary. If it is not in your `PATH`, set the executable field to the full path, for example:
 
 ```bash

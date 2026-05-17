@@ -496,10 +496,9 @@ class LauncherApp:
                 True,
                 ("draft-mtp", "mtp", "none", "ngram-cache", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod"),
             ),
-            "--spec-draft-n-max": FlagConfig("Draft tokens", "16", False, True, step_mode="power2"),
+            "--spec-draft-n-max": FlagConfig("Draft tokens", "3", False),
             "--spec-draft-n-min": FlagConfig("Draft min", "0", False),
             "--spec-draft-p-min": FlagConfig("Draft probability", "0.75", False),
-            "-cd": FlagConfig("Draft context", "2048", False, True, step_mode="context"),
             "-ngld": FlagConfig("Draft GPU layers", "99", False),
             "--jinja": FlagConfig("Jinja tools", "", False, False),
             "--fit": FlagConfig("Auto fit VRAM", "", False, False, (), ("ik_llama.cpp",)),
@@ -530,10 +529,9 @@ class LauncherApp:
             "-a": "Model alias shown to API clients. Useful when clients expect a specific model name.",
             "-to": "Server read/write timeout in seconds.",
             "--spec-type": "Speculative decoding type. Use draft-mtp for current llama.cpp MTP builds; older MTP branches may use mtp. Leave disabled for normal decoding.",
-            "--spec-draft-n-max": "Speculative decoding: maximum draft tokens per verification step. Usually a power-of-two value such as 8, 16, 32, or 64.",
+            "--spec-draft-n-max": "Speculative decoding: maximum draft tokens per verification step. This is a normal integer count, not a power-of-two value. MTP often uses small values such as 3.",
             "--spec-draft-n-min": "Speculative decoding: minimum number of draft tokens before the main model verifies.",
             "--spec-draft-p-min": "Speculative decoding: minimum probability threshold for accepting draft tokens.",
-            "-cd": "Draft model context size in tokens. Only applies when a draft model is selected.",
             "-ngld": "GPU layers for the draft or MTP path. Long form is --spec-draft-ngl. Use a high value for full draft offload when VRAM allows.",
             "--jinja": "Enable Jinja chat templates. Needed by some tool/function-calling clients and supported by llama.cpp-style servers.",
             "--fit": "ik_llama.cpp only. Automatically fits as many tensors as possible into available VRAM instead of choosing a fixed layer count.",
@@ -1414,9 +1412,6 @@ class LauncherApp:
             "--draft-min": "--spec-draft-n-min",
             "--spec-draft-p-min": "--spec-draft-p-min",
             "--draft-p-min": "--spec-draft-p-min",
-            "--spec-draft-ctx-size": "-cd",
-            "--ctx-size-draft": "-cd",
-            "-cd": "-cd",
             "--spec-draft-ngl": "-ngld",
             "--gpu-layers-draft": "-ngld",
             "--n-gpu-layers-draft": "-ngld",
@@ -1994,10 +1989,13 @@ class LauncherApp:
             if validate_model and not Path(draft_model_path).expanduser().exists():
                 raise ValueError("draft model path does not exist")
             command.extend(["-md", draft_model_path])
+        fit_enabled = "--fit" in self.flags and self.flags["--fit"].enabled and self.flag_supported_by_current_inferer("--fit")
         for flag, cfg in self.flags.items():
             if not cfg.enabled:
                 continue
             if not self.flag_supported_by_current_inferer(flag):
+                continue
+            if fit_enabled and flag == "-ngl":
                 continue
             if flag == "--mmproj" and not cfg.value.strip():
                 continue
