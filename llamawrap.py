@@ -311,19 +311,23 @@ def find_mmproj(model_path: str) -> str:
 
 
 class GPUMonitor:
-    def usage(self) -> tuple[int | None, int | None, str]:
-        nvidia = self._nvidia_usage()
-        if nvidia[2] != "not found":
+    """Returns (process_used, total_used, total_available, source)."""
+
+    def usage(self, pid: int | None = None) -> tuple[int | None, int | None, int | None, str]:
+        nvidia = self._nvidia_usage(pid)
+        if nvidia[3] != "not found":
             return nvidia
         amd = self._amd_usage()
-        if amd[2] != "not found":
+        if amd[3] != "not found":
             return amd
-        return None, None, "GPU not detected"
+        return None, None, None, "GPU not detected"
 
-    def _nvidia_usage(self) -> tuple[int | None, int | None, str]:
+    def _nvidia_usage(self, pid: int | None = None) -> tuple[int | None, int | None, int | None, str]:
         if not shutil.which("nvidia-smi"):
-            return None, None, "not found"
+            return None, None, None, "not found"
         try:
+            if pid is not None:
+                return self._nvidia_usage_per_process(pid)
             output = subprocess.check_output(
                 [
                     "nvidia-smi",
@@ -336,13 +340,58 @@ class GPUMonitor:
             )
             line = output.strip().splitlines()[0]
             used_mib, total_mib = [int(part.strip()) for part in line.split(",")[:2]]
-            return used_mib * 1024 * 1024, total_mib * 1024 * 1024, "NVIDIA"
+            return used_mib * 1024 * 1024, used_mib * 1024 * 1024, total_mib * 1024 * 1024, "NVIDIA"
         except Exception:
-            return None, None, "NVIDIA"
+            return None, None, None, "NVIDIA"
 
-    def _amd_usage(self) -> tuple[int | None, int | None, str]:
+    def _nvidia_usage_per_process(self, pid: int) -> tuple[int | None, int | None, int | None, str]:
+        try:
+            output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-compute-apps=pid,used_gpu_memory,gpu_uuid",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            proc_mib = 0
+            pid_found = False
+            for line in output.strip().splitlines():
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    line_pid_str = parts[0].strip()
+                    try:
+                        line_pid = int(line_pid_str)
+                    except ValueError:
+                        continue
+                    if line_pid == pid:
+                        pid_found = True
+                        proc_mib += int(parts[1].strip())
+            # Get total and total_used from GPU 0
+            total_output = subprocess.check_output(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            line = total_output.strip().splitlines()[0]
+            total_used_mib, total_mib = [int(part.strip()) for part in line.split(",")[:2]]
+            # If PID not found yet (e.g. during model loading), fall back to total GPU usage
+            if not pid_found:
+                proc_mib = total_used_mib
+            return proc_mib * 1024 * 1024, total_used_mib * 1024 * 1024, total_mib * 1024 * 1024, "NVIDIA"
+        except Exception:
+            return None, None, None, "NVIDIA"
+
+    def _amd_usage(self) -> tuple[int | None, int | None, int | None, str]:
         if not shutil.which("rocm-smi"):
-            return None, None, "not found"
+            return None, None, None, "not found"
         try:
             output = subprocess.check_output(["rocm-smi", "--showmeminfo", "vram", "--json"], text=True, stderr=subprocess.DEVNULL, timeout=3)
             data = json.loads(output)
@@ -358,9 +407,9 @@ class GPUMonitor:
                         used = amount
                     elif "total memory" in lower:
                         total = amount
-            return used, total, "AMD"
+            return used, used, total, "AMD"
         except Exception:
-            return None, None, "AMD"
+            return None, None, None, "AMD"
 
 
 class Tooltip:
@@ -430,6 +479,7 @@ class LauncherApp:
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.estimate: dict[str, float] = {}
         self.vram_used: int | None = None
+        self.vram_total_used: int | None = None
         self.vram_total: int | None = None
         self.vram_source = "GPU not detected"
         self.model_loaded = False
@@ -1769,8 +1819,15 @@ class LauncherApp:
 
     def on_draft_model_changed(self) -> None:
         self.mark_dirty()
+        # When MTP is active the main model carries the draft heads,
+        # so a separate draft model is not used.
+        spec_type_val = str(self.flags.get("--spec-type", object()).value).strip().lower() if "--spec-type" in self.flags and self.flags["--spec-type"].enabled else ""
+        mtp_active = any(t.strip() in ("mtp", "draft-mtp") for t in spec_type_val.split(",") if t.strip())
         value = self.draft_model_var.get().strip() if self.draft_model_var else ""
-        if value and Path(value).expanduser().exists():
+        if mtp_active and value:
+            self.append_log("warn", "Draft model ignored: MTP (--spec-type draft-mtp/mtp) uses built-in heads.")
+            self.draft_model_meta = None
+        elif value and Path(value).expanduser().exists():
             self.draft_model_meta = parse_gguf(value)
             for warning in self.draft_model_meta.warnings:
                 self.append_log("warn", warning)
@@ -1890,19 +1947,41 @@ class LauncherApp:
             k_dim = int(fallback_dim)
             v_dim = int(fallback_dim)
             kv_cache = context * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
+        # -- MTP speculative KV cache --
+        # draft-mtp / mtp uses built-in heads; no separate draft model needed.
+        # During generation each step produces n_draft speculative tokens that
+        # need temporary KV slots on every layer, so peak VRAM adds that extra KV.
+        mtp_kv = 0.0
+        mtp_active = False
+        spec_type_val = str(self.flags.get("--spec-type", object()).value).strip().lower() if "--spec-type" in self.flags and self.flags["--spec-type"].enabled else ""
+        for token in spec_type_val.split(","):
+            token = token.strip()
+            if token in ("mtp", "draft-mtp"):
+                mtp_active = True
+                break
+        if mtp_active:
+            n_draft = self.get_int_flag("--spec-draft-n-max", 3)
+            n_draft = max(1, min(n_draft, 16))
+            if k_dim and v_dim:
+                mtp_kv = n_draft * n_layers * ((k_dim * k_bytes) + (v_dim * v_bytes))
+            else:
+                mtp_kv = n_draft * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
         mmproj_size = 0.0
         mmproj_path = self.flags["--mmproj"].value
         if self.flags["--mmproj"].enabled and mmproj_path and Path(mmproj_path).expanduser().exists():
             mmproj_size = float(Path(mmproj_path).expanduser().stat().st_size)
-        draft_size = float(self.draft_model_meta.size) if self.draft_model_meta else 0.0
+        # When MTP is active the main model carries the draft heads; a separate
+        # draft model is not used, so skip counting its weight.
+        draft_size = 0.0 if mtp_active else (float(self.draft_model_meta.size) if self.draft_model_meta else 0.0)
         weights = (min(ngl, total_layers) / total_layers) * model_size
         overhead = 0.0
         if model_size:
             overhead = (1.0 * GB) + (weights * 0.08) + (kv_cache * 0.05)
-        estimated = weights + draft_size + mmproj_size + kv_cache + overhead if model_size else 0.0
+        estimated = weights + draft_size + mmproj_size + kv_cache + mtp_kv + overhead if model_size else 0.0
         self.estimate = {
             "weights": weights,
             "kv": kv_cache,
+            "mtp_kv": mtp_kv,
             "mmproj": mmproj_size,
             "draft": draft_size,
             "overhead": overhead,
@@ -1936,13 +2015,17 @@ class LauncherApp:
 
     def update_vram_ui(self) -> None:
         process_running = self.process is not None and self.process.poll() is None
-        used = self.vram_used if process_running and self.vram_used is not None else self.estimate.get("estimated", 0.0)
+        has_runtime = process_running and self.vram_used is not None
+        used = self.vram_used if has_runtime else self.estimate.get("estimated", 0.0)
         total = self.vram_total
+        total_used = self.vram_total_used
         percent = min(100.0, (used / total) * 100) if used and total else 0.0
         self.draw_vram_bar(percent)
-        prefix = "Runtime" if process_running and self.vram_used is not None else "Estimated"
+        prefix = "Server" if has_runtime else "Estimated"
         bits = [f"{prefix} {human_bytes(used)}"]
-        if total:
+        if total_used and total:
+            bits.append(f"| GPU {human_bytes(total_used)} / {human_bytes(total)}")
+        elif total:
             bits.append(f"of {human_bytes(total)}")
         bits.append(f"({self.vram_source})")
         self.vram_label_var.set(" ".join(bits))
@@ -1961,6 +2044,7 @@ class LauncherApp:
         segments = [
             ("weights", "#58a6ff"),
             ("kv", "#f2cc60"),
+            ("mtp_kv", "#f778ba"),
             ("draft", "#a371f7"),
             ("mmproj", "#3fb950"),
             ("overhead", "#ff7b72"),
@@ -1974,6 +2058,12 @@ class LauncherApp:
             x2 = min(width, x + segment_width)
             canvas.create_rectangle(x, 0, x2, height, fill=color, outline="")
             x = x2
+        # Total GPU usage marker (dimmer line)
+        if self.vram_total_used is not None and total:
+            gpu_percent = min(100.0, (self.vram_total_used / total) * 100)
+            gpu_width = min(width, (gpu_percent / 100.0) * width)
+            canvas.create_line(gpu_width, 0, gpu_width, height, fill="#8b949e", width=1)
+        # Server usage marker (bright white line)
         if percent is not None and percent > 0:
             used_width = min(width, (percent / 100.0) * width)
             canvas.create_line(used_width, 0, used_width, height, fill="#ffffff", width=2)
@@ -1985,15 +2075,21 @@ class LauncherApp:
         ngl = int(self.estimate.get("ngl", 0))
         confidence = self.estimate_confidence()
         layer_text = self.describe_gpu_layers_for_estimate(total_layers, ngl) if total_layers else "no model layers available"
+        mtp_kv_bytes = self.estimate.get("mtp_kv", 0.0)
         parts = [
             f"Model {human_bytes(self.estimate.get('weights', 0.0))}",
             f"Context/KV {human_bytes(self.estimate.get('kv', 0.0))}",
+        ]
+        if mtp_kv_bytes > 0:
+            parts.append(f"MTP KV {human_bytes(mtp_kv_bytes)}")
+        parts.extend([
             f"Draft {human_bytes(self.estimate.get('draft', 0.0))}",
             f"MMProj {human_bytes(self.estimate.get('mmproj', 0.0))}",
             f"Overhead {human_bytes(self.estimate.get('overhead', 0.0))}",
-        ]
+        ])
+        legend = "Model blue + Context yellow + MTP KV pink + Draft purple + MMProj green + Overhead red\n"
         self.vram_breakdown_var.set(
-            "Model blue + Context yellow + Draft purple + MMProj green + Overhead red\n"
+            legend
             + " + ".join(parts)
             + f" = {human_bytes(self.estimate.get('estimated', 0.0))}\n"
             + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {confidence}"
@@ -2140,9 +2236,10 @@ class LauncherApp:
         self.root.after(600, self.refresh_process_state)
 
     def refresh_gpu_usage(self) -> None:
-        self.vram_used, self.vram_total, self.vram_source = self.gpu.usage()
-        self.update_vram_ui()
         process_running = self.process is not None and self.process.poll() is None
+        target_pid = self.process.pid if process_running else None
+        self.vram_used, self.vram_total_used, self.vram_total, self.vram_source = self.gpu.usage(target_pid)
+        self.update_vram_ui()
         # Poll every 2s while server is running, every 30s when idle
         interval = 2000 if process_running else 30000
         self.root.after(interval, self.refresh_gpu_usage)
