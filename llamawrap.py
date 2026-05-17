@@ -111,6 +111,8 @@ class HistoryStore:
         self.presets = [p for p in self.presets if p.get("preset_name") != name]
         self.save()
 
+
+
     def add_run(self, model: str, command: list[str]) -> None:
         self.runs.append(
             {
@@ -495,7 +497,7 @@ class LauncherApp:
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
         self.root.geometry("1060x720")
-        self.root.minsize(900, 620)
+        self.root.minsize(900, 700)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.configure_style()
         self.configure_text_shortcuts()
@@ -675,6 +677,8 @@ class LauncherApp:
             for key, virtual_event in (("c", "<<Copy>>"), ("C", "<<Copy>>"), ("x", "<<Cut>>"), ("X", "<<Cut>>"), ("v", "<<Paste>>"), ("V", "<<Paste>>")):
                 self.root.bind_class(class_name, f"<Control-{key}>", lambda event, ve=virtual_event: (event.widget.event_generate(ve), "break")[1])
 
+        self.root.bind("<Control-s>", lambda _event: self.save_current_preset() or "break")
+
     def build_ui(self) -> None:
         top_bar = tk.Frame(self.root, bg="#090c10", height=54)
         top_bar.pack(fill="x")
@@ -700,20 +704,23 @@ class LauncherApp:
         )
         preset_actions = tk.Frame(left, bg=self.colors["panel"])
         preset_actions.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
-        for col in range(4):
+        for col in range(5):
             preset_actions.columnconfigure(col, weight=1, uniform="preset_actions")
-        add_button = self.make_button(preset_actions, "➕", self.add_preset, width=46, bg=self.colors["add"], hover=self.colors["add_hover"])
-        add_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        Tooltip(add_button, "New preset\n\nSave the current launcher settings as a new preset.")
-        delete_button = self.make_button(preset_actions, "➖", self.delete_selected_preset, width=46, bg=self.colors["remove"], hover=self.colors["remove_hover"])
-        delete_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        Tooltip(delete_button, "Delete preset\n\nRemove the selected preset.")
-        save_button = self.make_button(preset_actions, "💾", self.save_current_preset, width=46, bg=self.colors["good"], hover=self.colors["good_hover"])
-        save_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
-        Tooltip(save_button, "Save preset\n\nUpdate the selected preset, or save the current settings as a preset.")
-        import_button = self.make_button(preset_actions, "📋", self.import_command_dialog, width=46, bg=self.colors["import"], hover=self.colors["import_hover"])
-        import_button.grid(row=0, column=3, sticky="ew")
-        Tooltip(import_button, "Import command\n\nPaste a server command and load recognized arguments into the UI.")
+        new_button = self.make_button(preset_actions, "New", self.new_preset, width=46, bg=self.colors["add"], hover=self.colors["add_hover"])
+        new_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        Tooltip(new_button, "New\n\nClear all fields to start a fresh preset.")
+        delete_button = self.make_button(preset_actions, "Delete", self.delete_selected_preset, width=46, bg=self.colors["remove"], hover=self.colors["remove_hover"])
+        delete_button.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        Tooltip(delete_button, "Delete\n\nRemove the selected preset.")
+        save_button = self.make_button(preset_actions, "Save", self.save_current_preset, width=46, bg=self.colors["good"], hover=self.colors["good_hover"])
+        save_button.grid(row=0, column=2, sticky="ew", padx=(0, 4))
+        Tooltip(save_button, "Save (Ctrl+S)\n\nUpdate the selected preset with current settings.")
+        save_as_button = self.make_button(preset_actions, "Save as", self.save_as_preset, width=46, bg=self.colors["good"], hover=self.colors["good_hover"])
+        save_as_button.grid(row=0, column=3, sticky="ew", padx=(0, 4))
+        Tooltip(save_as_button, "Save as\n\nSave current settings as a new preset with a new name.")
+        import_button = self.make_button(preset_actions, "Import", self.import_command_dialog, width=46, bg=self.colors["import"], hover=self.colors["import_hover"])
+        import_button.grid(row=0, column=4, sticky="ew")
+        Tooltip(import_button, "Import\n\nPaste a server command and load recognized arguments into the UI.")
 
         self.preset_list = tk.Listbox(
             left,
@@ -737,7 +744,8 @@ class LauncherApp:
         right = tk.Frame(body, bg=self.colors["bg"])
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(4, weight=1)
+        right.rowconfigure(1, weight=1)
+        right.rowconfigure(4, weight=2, minsize=150)
 
         model_panel = self.make_panel(right, padx=14, pady=14)
         model_panel.grid(row=0, column=0, sticky="ew")
@@ -783,7 +791,7 @@ class LauncherApp:
         Tooltip(draft_entry, "Draft model\n\nOptional smaller GGUF model for speculative decoding. It is launched with -md/--model-draft.")
 
         flags_panel = self.make_panel(right, padx=14, pady=12)
-        flags_panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        flags_panel.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         flags_panel.columnconfigure(0, weight=1)
         flags_header = tk.Frame(flags_panel, bg=self.colors["panel"])
         flags_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -797,8 +805,20 @@ class LauncherApp:
         clear_flags_button = self.make_button(flags_header, "🧹", self.clear_flags_to_default, width=34, bg=self.colors["panel_soft"])
         clear_flags_button.grid(row=0, column=2, sticky="e")
         Tooltip(clear_flags_button, "Clear flags\n\nUntick every flag, empty all flag values, and clear Extra args.")
-        self.flags_frame = tk.Frame(flags_panel, bg=self.colors["panel"])
-        self.flags_frame.grid(row=1, column=0, sticky="ew")
+        self.flags_canvas = tk.Canvas(flags_panel, bg=self.colors["panel"], highlightthickness=0)
+        self.flags_canvas.grid(row=1, column=0, sticky="nsew")
+        self.flags_scrollbar = ttk.Scrollbar(flags_panel, orient="vertical", command=self.flags_canvas.yview)
+        self.flags_scrollbar.grid(row=1, column=1, sticky="ns")
+        self.flags_canvas.configure(yscrollcommand=self.flags_scrollbar.set)
+        self.flags_canvas.bind("<Configure>", self._on_flags_canvas_resize)
+        if os.name == "nt":
+            self.flags_canvas.bind("<MouseWheel>", lambda e: self.flags_canvas.yview_scroll(int(-e.delta / 120), "units"))
+        else:
+            self.flags_canvas.bind("<Button-4>", lambda e: self.flags_canvas.yview_scroll(-1, "units"))
+            self.flags_canvas.bind("<Button-5>", lambda e: self.flags_canvas.yview_scroll(1, "units"))
+        self.flags_frame = tk.Frame(self.flags_canvas, bg=self.colors["panel"])
+        self.flags_canvas.create_window((0, 0), window=self.flags_frame, anchor="nw")
+        self.flags_frame.bind("<Configure>", lambda e: self.flags_canvas.configure(scrollregion=self.flags_canvas.bbox("all")))
         for col in range(3):
             self.flags_frame.columnconfigure(col, weight=1, uniform="flag_columns")
         extra_row = tk.Frame(flags_panel, bg=self.colors["panel"])
@@ -818,6 +838,8 @@ class LauncherApp:
 
         controls = tk.Frame(right, bg=self.colors["bg"])
         controls.grid(row=2, column=0, sticky="ew", pady=(12, 10))
+        controls.rowconfigure(0, weight=1)
+        controls.rowconfigure(1, weight=1)
         controls.columnconfigure(6, weight=1)
         launch_button = self.make_button(controls, "▶", self.launch, width=52, bg=self.colors["good"], hover=self.colors["good_hover"])
         launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -828,9 +850,6 @@ class LauncherApp:
         clear_button = self.make_button(controls, "🧹", self.clear_logs, width=52, bg=self.colors["panel_soft"])
         clear_button.grid(row=0, column=2, sticky="ew", padx=(0, 8))
         Tooltip(clear_button, "Clear output\n\nClear the output log.")
-        copy_button = self.make_button(controls, "⧉", self.copy_command, width=52, bg=self.colors["panel_soft"])
-        copy_button.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(8, 0))
-        Tooltip(copy_button, "Copy command\n\nCopy the full launch command to the clipboard.")
         self.auto_restart_var = tk.BooleanVar(value=False)
         auto_restart = tk.Checkbutton(
             controls,
@@ -846,20 +865,24 @@ class LauncherApp:
             highlightthickness=0,
             font=("TkDefaultFont", 13, "bold"),
         )
-        auto_restart.grid(row=0, column=3, sticky="w")
+        auto_restart.grid(row=0, column=3, sticky="w", padx=(8, 0))
         Tooltip(auto_restart, "Auto-restart\n\nRestart the selected inferer automatically if it crashes. Manual Stop will not restart it.")
+        copy_button = self.make_button(controls, "⧉", self.copy_command, width=52, bg=self.colors["panel_soft"])
+        copy_button.grid(row=0, column=4, sticky="ew", padx=(8, 8))
+        Tooltip(copy_button, "Copy command\n\nCopy the full launch command to the clipboard.")
         self.command_var = tk.StringVar()
         self.command_label = tk.Label(
             controls,
             textvariable=self.command_var,
             bg=self.colors["bg"],
             fg=self.colors["muted"],
-            anchor="w",
+            anchor="nw",
             justify="left",
-            font=("DejaVu Sans Mono", 9),
             wraplength=760,
+            font=("DejaVu Sans Mono", 9),
+            height=2,
         )
-        self.command_label.grid(row=1, column=1, columnspan=6, sticky="ew", pady=(8, 0))
+        self.command_label.grid(row=0, column=5, columnspan=2, rowspan=2, sticky="ew", padx=(0, 0))
 
         output_panel = self.make_panel(right, padx=14, pady=12)
         output_panel.grid(row=4, column=0, sticky="nsew")
@@ -1296,6 +1319,9 @@ class LauncherApp:
             remove.grid(row=0, column=2, sticky="e", padx=(6, 0))
             Tooltip(remove, f"Remove {flag}\n\nHide this flag from the current UI. Add it again with the plus button.")
             self.flag_vars[flag] = values
+        # blank row at bottom for visual breathing room
+        padding_row = tk.Frame(self.flags_frame, bg=self.colors["panel"], height=12)
+        padding_row.grid(row=(idx // 3) + 1, column=0, columnspan=3, sticky="ew")
 
     def clear_flags_to_default(self) -> None:
         for cfg in self.flags.values():
@@ -1329,15 +1355,57 @@ class LauncherApp:
         preset = self.history.presets[selection[0]]
         self.load_preset(preset)
 
-    def add_preset(self) -> None:
+    def new_preset(self) -> None:
         self.selected_preset = None
-        self.save_current_preset(force_name_prompt=True)
+        self.saved_snapshot = ""
+        self.dirty = False
+        self.model_var.set("")
+        self.mmproj_var.set("")
+        if self.draft_model_var:
+            self.draft_model_var.set("")
+        if self.extra_args_var:
+            self.extra_args_var.set("")
+        self.flags = self.default_flags()
+        self.hidden_flags = set()
+        self.model_meta = None
+        self.draft_model_meta = None
+        self.render_flags()
+        self.render_presets()
+        self.recalculate_vram()
 
-    def save_current_preset(self, force_name_prompt: bool = False) -> None:
-        default = self.selected_preset or (Path(self.model_var.get()).stem if self.model_var.get() else "")
-        name = default
-        if force_name_prompt or not name:
-            name = simpledialog.askstring("Save preset", "Preset name:", initialvalue=default, parent=self.root)
+    def save_current_preset(self) -> None:
+        if not self.selected_preset:
+            messagebox.showwarning("No preset selected", "Select a preset to save, or use Save as to create a new one.", parent=self.root)
+            return
+        name = self.selected_preset
+        preset = {
+            "preset_name": name.strip(),
+            "inferer": self.current_inferer_key(),
+            "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
+            "model_path": self.model_var.get().strip(),
+            "mmproj_path": self.flags["--mmproj"].value,
+            "draft_model_path": self.draft_model_var.get().strip() if self.draft_model_var else "",
+            "extra_args": self.extra_args_var.get().strip() if self.extra_args_var else "",
+            "hidden_flags": sorted(self.hidden_flags),
+            "flags": {
+                flag: {
+                    "value": cfg.value,
+                    "enabled": cfg.enabled,
+                    "value_required": cfg.value_required,
+                    "custom": cfg.custom,
+                    "step_mode": cfg.step_mode,
+                }
+                for flag, cfg in self.flags.items()
+            },
+        }
+        self.history.upsert_preset(preset)
+        self.saved_snapshot = self.snapshot_state()
+        self.dirty = False
+        self.render_presets()
+
+    def save_as_preset(self) -> None:
+        default = Path(self.model_var.get()).stem if self.model_var.get() else ""
+        name = simpledialog.askstring("Save preset as", "Preset name:", initialvalue=default, parent=self.root)
         if not name:
             return
         preset = {
@@ -1583,6 +1651,8 @@ class LauncherApp:
         self.history.delete_preset(self.selected_preset)
         self.selected_preset = None
         self.render_presets()
+
+
 
     def load_preset(self, preset: dict[str, Any]) -> None:
         self.loading_preset = True
@@ -2031,6 +2101,11 @@ class LauncherApp:
         self.vram_label_var.set(" ".join(bits))
         self.update_vram_breakdown()
 
+    def _on_flags_canvas_resize(self, event: tk.Event) -> None:
+        if hasattr(self, "flags_frame"):
+            self.flags_frame.configure(width=event.width)
+        self.flags_canvas.configure(scrollregion=self.flags_canvas.bbox("all"))
+
     def draw_vram_bar(self, percent: float | None = None) -> None:
         if not hasattr(self, "vram_bar"):
             return
@@ -2317,7 +2392,8 @@ class LauncherApp:
 
     def on_close(self) -> None:
         if self.process and self.process.poll() is None:
-            self.stop_process()
+            if messagebox.askyesno("Server running", "The inferer server is still running. Stop it before closing?", parent=self.root):
+                self.stop_process()
         self.root.destroy()
 
     def run(self) -> None:
