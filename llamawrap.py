@@ -48,6 +48,7 @@ class FlagConfig:
     inferers: tuple[str, ...] = ()
     custom: bool = False
     step_mode: str = ""
+    group: str = ""
 
 
 @dataclass
@@ -230,7 +231,7 @@ def parse_gguf(path: str) -> GGUFMetadata:
     meta = GGUFMetadata(path=str(model), size=model.stat().st_size)
     try:
         with model.open("rb") as fh:
-            data = fh.read(min(max(meta.size, 128), 64 * 1024 * 1024))
+            data = fh.read(min(max(meta.size, 128), 2 * 1024 * 1024))
         if len(data) < 24 or data[:4] != b"GGUF":
             meta.warnings.append("This file does not look like a standard GGUF model. The launcher will skip metadata-based estimates.")
             return meta
@@ -474,73 +475,85 @@ class LauncherApp:
     def default_flags(self) -> dict[str, FlagConfig]:
         cpu_threads = max(1, os.cpu_count() or 1)
         return {
-            "-ngl": FlagConfig("GPU layers", "auto"),
-            "-c": FlagConfig("Context size", "32768", step_mode="context"),
-            "-t": FlagConfig("Threads", str(cpu_threads)),
-            "-tb": FlagConfig("Batch threads", "", False),
-            "-fa": FlagConfig("Flash attention", "auto", True, True, ("auto", "on", "off")),
-            "-ctk": FlagConfig("KV cache K", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl")),
-            "-ctv": FlagConfig("KV cache V", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl")),
-            "--port": FlagConfig("Port", str(DEFAULT_SERVER_PORT)),
-            "--host": FlagConfig("Host", "127.0.0.1"),
-            "-b": FlagConfig("Batch", "2048"),
-            "-ub": FlagConfig("UBatch", "512"),
-            "-np": FlagConfig("Parallel slots", "-1"),
-            "--threads-http": FlagConfig("HTTP threads", "-1", False),
-            "-a": FlagConfig("Alias", "", False),
-            "-to": FlagConfig("Timeout", "600", False),
+            # -- Model / VRAM --
+            "-ngl": FlagConfig("GPU layers", "auto", group="Model / VRAM"),
+            "--fit": FlagConfig("Fit", "on", False, True, ("on", "off"), group="Model / VRAM"),
+            "--fit-margin": FlagConfig("Fit margin MiB", "1024", False, True, (), ("ik_llama.cpp",), group="Model / VRAM"),
+            "-cram": FlagConfig("Cache RAM MiB", "8192", False, True, group="Model / VRAM"),
+            "-ncmoe": FlagConfig("CPU MoE layers", "", False, group="Model / VRAM"),
+            # -- Context / KV Cache --
+            "-c": FlagConfig("Context size", "32768", step_mode="context", group="Context / KV Cache"),
+            "-ctk": FlagConfig("KV cache K", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"), group="Context / KV Cache"),
+            "-ctv": FlagConfig("KV cache V", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"), group="Context / KV Cache"),
+            "-khad": FlagConfig("K Hadamard", "", False, False, (), ("ik_llama.cpp",), group="Context / KV Cache"),
+            "-vhad": FlagConfig("V Hadamard", "", False, False, (), ("ik_llama.cpp",), group="Context / KV Cache"),
+            # -- Threads --
+            "-t": FlagConfig("Threads", str(cpu_threads), group="Threads"),
+            "-tb": FlagConfig("Batch threads", "", False, group="Threads"),
+            # -- Memory --
+            "-fa": FlagConfig("Flash attention", "auto", True, True, ("auto", "on", "off"), group="Memory"),
+            "-mla": FlagConfig("MLA mode", "3", False, True, ("0", "1", "2", "3"), ("ik_llama.cpp",), group="Memory"),
+            "-fmoe": FlagConfig("Fused MoE", "", False, False, (), ("ik_llama.cpp",), group="Memory"),
+            # -- Server --
+            "--port": FlagConfig("Port", str(DEFAULT_SERVER_PORT), group="Server"),
+            "--host": FlagConfig("Host", "127.0.0.1", group="Server"),
+            "-np": FlagConfig("Parallel slots", "-1", group="Server"),
+            "-a": FlagConfig("Alias", "", False, group="Server"),
+            "-to": FlagConfig("Timeout", "600", False, group="Server"),
+            # -- Batch --
+            "-b": FlagConfig("Batch", "2048", group="Batch"),
+            "-ub": FlagConfig("UBatch", "512", group="Batch"),
+            # -- Speculative Decoding --
             "--spec-type": FlagConfig(
                 "Spec type",
                 "draft-mtp",
                 False,
                 True,
-                ("draft-mtp", "mtp", "none", "ngram-cache", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod"),
+                ("draft-mtp", "draft-simple", "draft-eagle3", "mtp", "none", "ngram-cache", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod"),
+                group="Speculative Decoding",
             ),
-            "--spec-draft-n-max": FlagConfig("Draft tokens", "3", False),
-            "--spec-draft-n-min": FlagConfig("Draft min", "0", False),
-            "--spec-draft-p-min": FlagConfig("Draft probability", "0.75", False),
-            "-ngld": FlagConfig("Draft GPU layers", "99", False),
-            "--jinja": FlagConfig("Jinja tools", "", False, False),
-            "--fit": FlagConfig("Auto fit VRAM", "", False, False, (), ("ik_llama.cpp",)),
-            "--fit-margin": FlagConfig("Fit margin MiB", "1024", False, True, (), ("ik_llama.cpp",)),
-            "-mla": FlagConfig("MLA mode", "3", False, True, ("0", "1", "2", "3"), ("ik_llama.cpp",)),
-            "-fmoe": FlagConfig("Fused MoE", "", False, False, (), ("ik_llama.cpp",)),
-            "-cram": FlagConfig("RAM prompt cache", "8192", False, True, (), ("ik_llama.cpp",)),
-            "-khad": FlagConfig("K Hadamard", "", False, False, (), ("ik_llama.cpp",)),
-            "-vhad": FlagConfig("V Hadamard", "", False, False, (), ("ik_llama.cpp",)),
-            "--mmproj": FlagConfig("MMProj", "", False),
+            "--spec-draft-n-max": FlagConfig("Draft tokens", "3", False, group="Speculative Decoding"),
+            "--spec-draft-n-min": FlagConfig("Draft min", "0", False, group="Speculative Decoding"),
+            "--spec-draft-p-min": FlagConfig("Draft probability", "0.75", False, group="Speculative Decoding"),
+            "-ngld": FlagConfig("Draft GPU layers", "99", False, group="Speculative Decoding"),
+            # -- Generation --
+            "--reasoning": FlagConfig("Reasoning", "auto", False, True, ("auto", "on", "off"), group="Generation"),
+            "--jinja": FlagConfig("Jinja templates", "", False, False, group="Generation"),
+            # -- Multimodal --
+            "--mmproj": FlagConfig("MMProj", "", False, group="Multimodal"),
         }
 
     def flag_help(self) -> dict[str, str]:
         return {
-            "-ngl": "GPU layers to keep in VRAM. Use 'auto' for llama.cpp's automatic fit, 'all' to try full offload, 0 for CPU-only, or a number for a fixed layer count.",
-            "-c": "Context size in tokens. Larger values allow longer prompts/conversations but use more KV-cache memory. 0 uses the model default.",
-            "-t": "CPU generation threads. Usually set near your physical CPU core count; -1 lets llama.cpp choose.",
-            "-tb": "CPU threads used for prompt/batch processing. Leave disabled to use the same value as generation threads.",
-            "-fa": "Flash Attention mode. auto lets llama.cpp decide, on forces it, off disables it. Use off if your GPU/backend reports flash-attention errors.",
-            "-ctk": "KV cache data type for K. f16 is highest compatibility; q8_0/q5/q4 use less memory with possible quality or speed tradeoffs.",
-            "-ctv": "KV cache data type for V. Match K for simplicity; quantized values reduce VRAM/RAM for long contexts.",
-            "--port": "HTTP port for llama-server. Use this in clients as http://host:port, for example 8123.",
-            "--host": "Bind address. 127.0.0.1 is local-only. 0.0.0.0 exposes the server to other devices on reachable networks.",
-            "-b": "Logical batch size. Higher can improve prompt processing throughput but uses more memory. Current llama.cpp default is 2048.",
-            "-ub": "Physical micro-batch size. Lower if you hit memory errors during prompt processing. Current llama.cpp default is 512.",
-            "-np": "Number of parallel server slots. -1 lets llama.cpp choose. Higher supports more simultaneous requests but increases memory use.",
-            "--threads-http": "HTTP worker threads for serving requests. -1 lets llama.cpp choose.",
-            "-a": "Model alias shown to API clients. Useful when clients expect a specific model name.",
-            "-to": "Server read/write timeout in seconds.",
-            "--spec-type": "Speculative decoding type. Use draft-mtp for current llama.cpp MTP builds; older MTP branches may use mtp. Leave disabled for normal decoding.",
-            "--spec-draft-n-max": "Speculative decoding: maximum draft tokens per verification step. This is a normal integer count, not a power-of-two value. MTP often uses small values such as 3.",
-            "--spec-draft-n-min": "Speculative decoding: minimum number of draft tokens before the main model verifies.",
-            "--spec-draft-p-min": "Speculative decoding: minimum probability threshold for accepting draft tokens.",
-            "-ngld": "GPU layers for the draft or MTP path. Long form is --spec-draft-ngl. Use a high value for full draft offload when VRAM allows.",
-            "--jinja": "Enable Jinja chat templates. Needed by some tool/function-calling clients and supported by llama.cpp-style servers.",
-            "--fit": "ik_llama.cpp only. Automatically fits as many tensors as possible into available VRAM instead of choosing a fixed layer count.",
-            "--fit-margin": "ik_llama.cpp only. Safety VRAM margin in MiB used with --fit. Increase if model loading hits CUDA out-of-memory.",
-            "-mla": "ik_llama.cpp only. MLA mode for DeepSeek-style MLA models. Leave disabled unless the model/docs recommend it.",
+            "-ngl": "Max layers to offload to GPU. 'auto' (default) lets llama.cpp pick based on VRAM; 'all' tries full offload; 0 = CPU-only; or a specific layer count.",
+            "-c": "Prompt context size in tokens. 0 = use model default. Larger values allow longer conversations but consume more KV-cache memory.",
+            "-t": "CPU threads for generation. Set near your physical core count, or leave disabled for llama.cpp to choose.",
+            "-tb": "CPU threads for prompt/batch processing. Leave disabled to inherit from generation threads.",
+            "-fa": "Flash Attention. 'auto' (default) lets the backend decide; 'on' forces it; 'off' disables it. Disable if your GPU reports flash-attention errors.",
+            "-ctk": "KV cache data type for keys. f16 = best quality/compatibility; q8_0/q5/q4 = less memory, possible quality or speed tradeoffs.",
+            "-ctv": "KV cache data type for values. Match K for simplicity; quantized types reduce VRAM/RAM usage for long contexts.",
+            "--port": "HTTP server port. Clients connect at http://host:port.",
+            "--host": "Bind address. 127.0.0.1 = local only; 0.0.0.0 = expose to the network.",
+            "-b": "Logical maximum batch size (default: 2048). Affects prompt processing throughput vs. memory usage.",
+            "-ub": "Physical maximum batch size (default: 512). Lower if you hit memory errors during prompt processing.",
+            "-np": "Number of parallel server slots (default: -1 = auto). Higher supports more concurrent requests but uses more memory.",
+            "-a": "Model alias for API clients. Useful when a client expects a specific model name string.",
+            "-to": "Server read/write timeout in seconds (default: 600).",
+            "--spec-type": "Speculative decoding type(s). Comma-separated: draft-mtp, draft-simple, draft-eagle3, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod. 'none' = disabled.",
+            "--spec-draft-n-max": "Max tokens to draft per speculative decoding step (default: 16). MTP models typically use small values (2-6).",
+            "--spec-draft-n-min": "Minimum draft tokens before verification (default: 0).",
+            "--spec-draft-p-min": "Min probability threshold for greedy draft acceptance (default: 0.75). Higher = stricter acceptance.",
+            "-ngld": "GPU layers for the draft/MTP path (long form: --spec-draft-ngl). High value for full draft offload when VRAM allows.",
+            "--jinja": "Disable jinja chat template engine. Enabled by default; disable only for legacy clients that need raw model output.",
+            "--fit": "Auto-fit layers to VRAM. 'on' (default) adjusts unset args to fit device memory; 'off' disables auto-fit. Set to 'off' when using explicit -ngl.",
+            "--fit-margin": "ik_llama.cpp only. VRAM safety margin in MiB for --fit. Increase if model loading hits OOM. (Standard llama.cpp: use --fit-target instead.)",
+            "-mla": "ik_llama.cpp only. MLA mode for DeepSeek-style Multi-Latent Attention models. Leave disabled unless the model/docs recommend it.",
             "-fmoe": "ik_llama.cpp only. Enable fused MoE kernels for mixture-of-experts models when supported by your build.",
-            "-cram": "ik_llama.cpp only. Prompt/KV cache kept in host RAM, in MiB. 0 disables, -1 removes the limit.",
-            "-khad": "ik_llama.cpp only. Hadamard transform for K cache, useful when experimenting with aggressive KV quantization.",
-            "-vhad": "ik_llama.cpp only. Hadamard transform for V cache, useful when experimenting with aggressive KV quantization.",
+            "-cram": "Maximum KV/prompt cache size in MiB (default: 8192). 0 = disable, -1 = no limit. Requires unified KV for best results.",
+            "-khad": "ik_llama.cpp only. Hadamard transform on K cache for aggressive KV quantization experiments.",
+            "-vhad": "ik_llama.cpp only. Hadamard transform on V cache for aggressive KV quantization experiments.",
+            "-ncmoe": "Keep MoE expert weights on the CPU for the first N layers. Reduces VRAM usage for MoE models while keeping non-expert layers on GPU.",
+            "--reasoning": "Control reasoning/thinking behavior. 'auto' (default) = detect from chat template; 'on' = force enabled; 'off' = disable thought tags.",
         }
 
     def configure_style(self) -> None:
@@ -1141,6 +1154,19 @@ class LauncherApp:
         self.flag_vars.clear()
         items = [(flag, cfg) for flag, cfg in self.flags.items() if flag != "--mmproj" and self.flag_supported_by_current_inferer(flag)]
         help_text = self.flag_help()
+        # Sort by group order, then by flag name within group
+        group_order = {
+            "Model / VRAM": 0,
+            "Context / KV Cache": 1,
+            "Threads": 2,
+            "Memory": 3,
+            "Server": 4,
+            "Batch": 5,
+            "Speculative Decoding": 6,
+            "Generation": 7,
+            "Multimodal": 8,
+        }
+        items.sort(key=lambda fc: (group_order.get(fc[1].group, 99), fc[0]))
         for idx, (flag, cfg) in enumerate(items):
             row, col = divmod(idx, 3)
             cell = tk.Frame(self.flags_frame, bg=self.colors["panel"])
@@ -1394,7 +1420,6 @@ class LauncherApp:
             "-ub": "-ub",
             "--parallel": "-np",
             "-np": "-np",
-            "--threads-http": "--threads-http",
             "--alias": "-a",
             "-a": "-a",
             "--timeout": "-to",
@@ -1429,6 +1454,11 @@ class LauncherApp:
             "--k-cache-hadamard": "-khad",
             "-vhad": "-vhad",
             "--v-cache-hadamard": "-vhad",
+            "-ncmoe": "-ncmoe",
+            "--n-cpu-moe": "-ncmoe",
+            "--cpu-moe": "-ncmoe",
+            "--reasoning": "--reasoning",
+            "-rea": "--reasoning",
         }
         valueless_flags = {flag for flag, cfg in self.flags.items() if not cfg.value_required}
         changed = 0
@@ -1525,8 +1555,9 @@ class LauncherApp:
                 saved = saved_flags.get(flag, {})
                 cfg.value = str(saved.get("value", cfg.value) or "")
                 cfg.enabled = bool(saved.get("enabled", cfg.enabled))
-                cfg.value_required = bool(saved.get("value_required", cfg.value_required))
-                cfg.step_mode = str(saved.get("step_mode", cfg.step_mode) or "")
+                if cfg.custom:
+                    cfg.value_required = bool(saved.get("value_required", cfg.value_required))
+                    cfg.step_mode = str(saved.get("step_mode", cfg.step_mode) or "")
             self.hidden_flags = {str(flag) for flag in preset.get("hidden_flags", []) if str(flag) in self.flags}
             inferer = str(preset.get("inferer") or "llama.cpp")
             if self.inferer_var:
@@ -1990,6 +2021,7 @@ class LauncherApp:
                 raise ValueError("draft model path does not exist")
             command.extend(["-md", draft_model_path])
         fit_enabled = "--fit" in self.flags and self.flags["--fit"].enabled and self.flag_supported_by_current_inferer("--fit")
+        ngl_enabled = "-ngl" in self.flags and self.flags["-ngl"].enabled and bool(self.flags["-ngl"].value.strip())
         for flag, cfg in self.flags.items():
             if not cfg.enabled:
                 continue
@@ -1997,6 +2029,10 @@ class LauncherApp:
                 continue
             if fit_enabled and flag == "-ngl":
                 continue
+            # Modern llama.cpp has --fit on by default. When -ngl is explicitly
+            # set, add --fit off to avoid: "n_gpu_layers already set by user, abort"
+            if flag == "-ngl" and ngl_enabled and not fit_enabled:
+                command.extend(["--fit", "off"])
             if flag == "--mmproj" and not cfg.value.strip():
                 continue
             if cfg.value_required:
@@ -2106,7 +2142,10 @@ class LauncherApp:
     def refresh_gpu_usage(self) -> None:
         self.vram_used, self.vram_total, self.vram_source = self.gpu.usage()
         self.update_vram_ui()
-        self.root.after(2000, self.refresh_gpu_usage)
+        process_running = self.process is not None and self.process.poll() is None
+        # Poll every 2s while server is running, every 30s when idle
+        interval = 2000 if process_running else 30000
+        self.root.after(interval, self.refresh_gpu_usage)
 
     def set_status(self, status: str) -> None:
         self.status_var.set(status)
@@ -2143,6 +2182,10 @@ class LauncherApp:
         self.capture_tokens_per_second(text)
         self.update_status_from_log(text)
         self.output.configure(state="normal")
+        # Drop oldest lines if log is too large
+        lines = int(self.output.index("end-1c").split(".")[0])
+        if lines > 5000:
+            self.output.delete("1.0", "3.0")
         self.output.insert("end", text + "\n", level)
         self.output.see("end")
         self.output.configure(state="disabled")
