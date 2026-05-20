@@ -21,7 +21,7 @@ from typing import Any
 
 
 APP_TITLE = "llama-wrap"
-DEFAULT_SERVER_PORT = 8123
+DEFAULT_SERVER_PORT = 8080
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 HISTORY_FILE = APP_DIR / "history.json"
 GB = 1024**3
@@ -296,22 +296,6 @@ def parse_gguf(path: str) -> GGUFMetadata:
     return meta
 
 
-def find_mmproj(model_path: str) -> str:
-    model = Path(model_path).expanduser()
-    if not model.exists():
-        return ""
-    candidates: list[Path] = []
-    for path in model.parent.glob("*.gguf"):
-        lower = path.name.lower()
-        if path != model and ("mmproj" in lower or "vision" in lower or "projector" in lower):
-            candidates.append(path)
-    if not candidates:
-        return ""
-    model_tokens = set(re.split(r"[-_.\s]+", model.stem.lower()))
-    candidates.sort(key=lambda p: len(model_tokens.intersection(re.split(r"[-_.\s]+", p.stem.lower()))), reverse=True)
-    return str(candidates[0])
-
-
 class GPUMonitor:
     """Returns (process_used, total_used, total_available, source)."""
 
@@ -489,6 +473,7 @@ class LauncherApp:
         self.extra_args_var: tk.StringVar | None = None
         self.inferer_var: tk.StringVar | None = None
         self.inferer_executable_var: tk.StringVar | None = None
+        self.inferer_executable_entry: tk.Entry | None = None
         self.draft_model_var: tk.StringVar | None = None
         self.tokps_var: tk.StringVar | None = None
         self.last_tokens_per_second: float | None = None
@@ -516,58 +501,54 @@ class LauncherApp:
             "llama.cpp": InfererConfig(
                 "llama-server",
             ),
-            "ik_llama.cpp": InfererConfig(
-                "llama-server",
-            ),
             "Custom": InfererConfig(
                 "llama-server",
             ),
         }
 
     def default_flags(self) -> dict[str, FlagConfig]:
-        cpu_threads = max(1, os.cpu_count() or 1)
         return {
             # -- Model / VRAM --
-            "-ngl": FlagConfig("GPU layers", "auto", group="Model / VRAM"),
+            "-ngl": FlagConfig("GPU layers", "0", False, group="Model / VRAM"),
             "--fit": FlagConfig("Fit", "on", False, True, ("on", "off"), group="Model / VRAM"),
             "--fit-margin": FlagConfig("Fit margin MiB", "1024", False, True, (), ("ik_llama.cpp",), group="Model / VRAM"),
             "-cram": FlagConfig("Cache RAM MiB", "8192", False, True, group="Model / VRAM"),
             "-ncmoe": FlagConfig("CPU MoE layers", "", False, group="Model / VRAM"),
             # -- Context / KV Cache --
-            "-c": FlagConfig("Context size", "32768", step_mode="context", group="Context / KV Cache"),
-            "-ctk": FlagConfig("KV cache K", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"), group="Context / KV Cache"),
-            "-ctv": FlagConfig("KV cache V", "q4_0", True, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"), group="Context / KV Cache"),
+            "-c": FlagConfig("Context size", "4096", False, True, step_mode="context", group="Context / KV Cache"),
+            "-ctk": FlagConfig("KV cache K", "f16", False, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"), group="Context / KV Cache"),
+            "-ctv": FlagConfig("KV cache V", "f16", False, True, ("f32", "f16", "bf16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"), group="Context / KV Cache"),
             "-khad": FlagConfig("K Hadamard", "", False, False, (), ("ik_llama.cpp",), group="Context / KV Cache"),
             "-vhad": FlagConfig("V Hadamard", "", False, False, (), ("ik_llama.cpp",), group="Context / KV Cache"),
             # -- Threads --
-            "-t": FlagConfig("Threads", str(cpu_threads), group="Threads"),
-            "-tb": FlagConfig("Batch threads", "", False, group="Threads"),
+            "-t": FlagConfig("Threads", "-1", False, group="Threads"),
+            "-tb": FlagConfig("Batch threads", "-1", False, group="Threads"),
             # -- Memory --
-            "-fa": FlagConfig("Flash attention", "auto", True, True, ("auto", "on", "off"), group="Memory"),
-            "-mla": FlagConfig("MLA mode", "3", False, True, ("0", "1", "2", "3"), ("ik_llama.cpp",), group="Memory"),
+            "-fa": FlagConfig("Flash attention", "auto", False, True, ("auto", "on", "off"), group="Memory"),
+            "-mla": FlagConfig("MLA mode", "0", False, True, ("0", "1", "2", "3"), ("ik_llama.cpp",), group="Memory"),
             "-fmoe": FlagConfig("Fused MoE", "", False, False, (), ("ik_llama.cpp",), group="Memory"),
             # -- Server --
-            "--port": FlagConfig("Port", str(DEFAULT_SERVER_PORT), group="Server"),
-            "--host": FlagConfig("Host", "127.0.0.1", group="Server"),
-            "-np": FlagConfig("Parallel slots", "-1", group="Server"),
+            "--port": FlagConfig("Port", str(DEFAULT_SERVER_PORT), False, group="Server"),
+            "--host": FlagConfig("Host", "127.0.0.1", False, group="Server"),
+            "-np": FlagConfig("Parallel slots", "1", False, group="Server"),
             "-a": FlagConfig("Alias", "", False, group="Server"),
             "-to": FlagConfig("Timeout", "600", False, group="Server"),
             # -- Batch --
-            "-b": FlagConfig("Batch", "2048", group="Batch"),
-            "-ub": FlagConfig("UBatch", "512", group="Batch"),
+            "-b": FlagConfig("Batch", "2048", False, group="Batch"),
+            "-ub": FlagConfig("UBatch", "512", False, group="Batch"),
             # -- Speculative Decoding --
             "--spec-type": FlagConfig(
                 "Spec type",
-                "draft-mtp",
+                "none",
                 False,
                 True,
                 ("draft-mtp", "draft-simple", "draft-eagle3", "mtp", "none", "ngram-cache", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod"),
                 group="Speculative Decoding",
             ),
-            "--spec-draft-n-max": FlagConfig("Draft tokens", "3", False, group="Speculative Decoding"),
+            "--spec-draft-n-max": FlagConfig("Draft tokens", "16", False, group="Speculative Decoding"),
             "--spec-draft-n-min": FlagConfig("Draft min", "0", False, group="Speculative Decoding"),
             "--spec-draft-p-min": FlagConfig("Draft probability", "0.75", False, group="Speculative Decoding"),
-            "-ngld": FlagConfig("Draft GPU layers", "99", False, group="Speculative Decoding"),
+            "-ngld": FlagConfig("Draft GPU layers", "0", False, group="Speculative Decoding"),
             # -- Generation --
             "--reasoning": FlagConfig("Reasoning", "auto", False, True, ("auto", "on", "off"), group="Generation"),
             "--jinja": FlagConfig("Jinja templates", "", False, False, group="Generation"),
@@ -715,8 +696,8 @@ class LauncherApp:
 
         body = tk.Frame(self.root, bg=self.colors["bg"], padx=16, pady=16)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1, minsize=160)
-        body.columnconfigure(1, weight=4)
+        body.columnconfigure(0, weight=15, minsize=120)
+        body.columnconfigure(1, weight=85)
         body.rowconfigure(0, weight=1)
 
         left = tk.Frame(body, bg=self.colors["panel"], highlightbackground=self.colors["border"], highlightthickness=1)
@@ -725,33 +706,36 @@ class LauncherApp:
         left.columnconfigure(0, weight=1)
 
         preset_header = tk.Frame(left, bg=self.colors["panel"])
-        preset_header.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
+        preset_header.grid(row=0, column=0, sticky="ew", padx=10, pady=(14, 8))
         preset_header.columnconfigure(0, weight=1)
         tk.Label(preset_header, text="Presets", bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 13, "bold")).grid(
             row=0, column=0, sticky="w"
         )
         preset_actions = tk.Frame(left, bg=self.colors["panel"])
-        preset_actions.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 10))
-        for col in range(5):
+        preset_actions.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        for col in range(3):
             preset_actions.columnconfigure(col, weight=1, uniform="preset_actions")
-        new_button = self.make_button(preset_actions, "New", self.new_preset, width=46, bg=self.colors["add"], hover=self.colors["add_hover"])
-        new_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        new_button = self.make_button(preset_actions, "New", self.new_preset, width=38, bg=self.colors["add"], hover=self.colors["add_hover"])
+        new_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
         Tooltip(new_button, "New\n\nClear all fields to start a fresh preset.")
-        delete_button = self.make_button(preset_actions, "Delete", self.delete_selected_preset, width=46, bg=self.colors["remove"], hover=self.colors["remove_hover"])
-        delete_button.grid(row=0, column=1, sticky="ew", padx=(0, 4))
+        delete_button = self.make_button(preset_actions, "Delete", self.delete_selected_preset, width=38, bg=self.colors["remove"], hover=self.colors["remove_hover"])
+        delete_button.grid(row=0, column=1, sticky="ew", padx=(0, 3))
         Tooltip(delete_button, "Delete\n\nRemove the selected preset.")
-        save_button = self.make_button(preset_actions, "Save", self.save_current_preset, width=46, bg=self.colors["good"], hover=self.colors["good_hover"])
-        save_button.grid(row=0, column=2, sticky="ew", padx=(0, 4))
-        Tooltip(save_button, "Save (Ctrl+S)\n\nUpdate the selected preset with current settings.")
-        save_as_button = self.make_button(preset_actions, "Save as", self.save_as_preset, width=46, bg=self.colors["good"], hover=self.colors["good_hover"])
-        save_as_button.grid(row=0, column=3, sticky="ew", padx=(0, 4))
-        Tooltip(save_as_button, "Save as\n\nSave current settings as a new preset with a new name.")
-        import_button = self.make_button(preset_actions, "Import", self.import_command_dialog, width=46, bg=self.colors["import"], hover=self.colors["import_hover"])
-        import_button.grid(row=0, column=4, sticky="ew")
+        import_button = self.make_button(preset_actions, "Import", self.import_command_dialog, width=38, bg=self.colors["import"], hover=self.colors["import_hover"])
+        import_button.grid(row=0, column=2, sticky="ew")
         Tooltip(import_button, "Import\n\nPaste a server command and load recognized arguments into the UI.")
+        save_button = self.make_button(preset_actions, "Save", self.save_current_preset, width=38, bg=self.colors["good"], hover=self.colors["good_hover"])
+        save_button.grid(row=1, column=0, sticky="ew", padx=(0, 3), pady=(4, 0))
+        Tooltip(save_button, "Save (Ctrl+S)\n\nUpdate the selected preset with current settings.")
+        save_as_button = self.make_button(preset_actions, "Save as", self.save_as_preset, width=38, bg=self.colors["good"], hover=self.colors["good_hover"])
+        save_as_button.grid(row=1, column=1, sticky="ew", padx=(0, 3), pady=(4, 0))
+        Tooltip(save_as_button, "Save as\n\nSave current settings as a new preset with a new name.")
+        tk.Label(preset_actions, text="𐙼", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 12, "bold")).grid(
+            row=1, column=2, sticky="nsew", pady=(4, 0)
+        )
 
         preset_list_frame = tk.Frame(left, bg=self.colors["panel"])
-        preset_list_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        preset_list_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 14))
         preset_list_frame.rowconfigure(0, weight=1)
         preset_list_frame.columnconfigure(0, weight=1)
         preset_xscroll = ttk.Scrollbar(preset_list_frame, orient="horizontal")
@@ -789,11 +773,12 @@ class LauncherApp:
         right_scrollbar.grid(row=0, column=1, sticky="ns")
         self.right_canvas.configure(yscrollcommand=right_scrollbar.set)
         right = tk.Frame(self.right_canvas, bg=self.colors["bg"])
+        self.right_content = right
         self.right_window = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1, minsize=200)
         right.rowconfigure(4, weight=2, minsize=150)
-        right.bind("<Configure>", lambda _event: self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all")))
+        right.bind("<Configure>", lambda _event: self.update_right_scrollregion())
         self.right_canvas.bind("<Configure>", self._on_right_canvas_resize)
         self.root.bind_all("<MouseWheel>", self.on_mousewheel, add="+")
         self.root.bind_all("<Button-4>", self.on_mousewheel, add="+")
@@ -810,12 +795,12 @@ class LauncherApp:
         self.inferer_var.trace_add("write", lambda *_: self.on_inferer_changed())
         inferer_selector = self.make_choice_selector(model_panel, self.inferer_var, tuple(self.inferers.keys()))
         inferer_selector.grid(row=0, column=1, sticky="ew")
-        Tooltip(inferer_selector, "Inferer\n\nChoose which llama-server-compatible backend profile to use. ik_llama.cpp exposes extra ik-only tuning flags.")
+        Tooltip(inferer_selector, "Inferer\n\nChoose llama.cpp or Custom for a manually entered server command/path.")
         self.inferer_executable_var = tk.StringVar(value=self.current_inferer().executable)
         self.inferer_executable_var.trace_add("write", lambda *_: (self.mark_dirty(), self.update_command_preview()))
-        executable_entry = self.make_entry(model_panel, self.inferer_executable_var)
-        executable_entry.grid(row=0, column=2, sticky="ew", padx=(8, 0), ipady=6)
-        Tooltip(executable_entry, "Executable\n\nCommand or path to the server binary. For ik_llama.cpp this is often /path/to/ik_llama.cpp/build/bin/llama-server.")
+        self.inferer_executable_entry = self.make_entry(model_panel, self.inferer_executable_var)
+        self.inferer_executable_entry.grid(row=0, column=2, sticky="ew", padx=(8, 0), ipady=6)
+        Tooltip(self.inferer_executable_entry, "Executable\n\nCommand or path to the server binary.")
         tk.Label(model_panel, text="Model", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
         )
@@ -857,10 +842,10 @@ class LauncherApp:
         tk.Label(flags_header, text="Flags", bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 12, "bold")).grid(
             row=0, column=0, sticky="w"
         )
-        add_flag_button = self.make_button(flags_header, "➕", self.add_flag_dialog, width=34, bg=self.colors["add"], hover=self.colors["add_hover"])
+        add_flag_button = self.make_button(flags_header, "+", self.add_flag_dialog, width=34, bg=self.colors["add"], hover=self.colors["add_hover"])
         add_flag_button.grid(row=0, column=1, sticky="e", padx=(0, 6))
         Tooltip(add_flag_button, "Add flag\n\nAdd a custom server flag to the UI.")
-        clear_flags_button = self.make_button(flags_header, "🧹", self.clear_flags_to_default, width=34, bg=self.colors["panel_soft"])
+        clear_flags_button = self.make_button(flags_header, "Clear", self.clear_flags_to_default, width=52, bg=self.colors["panel_soft"])
         clear_flags_button.grid(row=0, column=2, sticky="e")
         Tooltip(clear_flags_button, "Clear flags\n\nUntick every flag, empty all flag values, and clear Extra args.")
         self.flags_frame = tk.Frame(flags_panel, bg=self.colors["panel"])
@@ -887,37 +872,46 @@ class LauncherApp:
 
         controls = tk.Frame(right, bg=self.colors["bg"])
         controls.grid(row=2, column=0, sticky="ew", pady=(12, 10))
-        controls.rowconfigure(0, weight=1)
-        controls.rowconfigure(1, weight=1)
-        controls.columnconfigure(6, weight=1)
-        launch_button = self.make_button(controls, "▶", self.launch, width=52, bg=self.colors["good"], hover=self.colors["good_hover"])
-        launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        controls.columnconfigure(0, weight=0)
+        controls.columnconfigure(1, weight=1)
+        button_bar = tk.Frame(controls, bg=self.colors["bg"])
+        button_bar.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        for col in range(5):
+            button_bar.columnconfigure(col, weight=1, uniform="control_buttons")
+        launch_button = self.make_button(button_bar, "Launch", self.launch, width=72, bg=self.colors["good"], hover=self.colors["good_hover"])
+        launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         Tooltip(launch_button, "Launch\n\nStart the selected inferer with the current settings.")
-        stop_button = self.make_button(controls, "■", self.stop_process, width=52, bg=self.colors["danger"], hover=self.colors["danger_hover"])
-        stop_button.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        stop_button = self.make_button(button_bar, "Stop", self.stop_process, width=72, bg=self.colors["danger"], hover=self.colors["danger_hover"])
+        stop_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         Tooltip(stop_button, "Stop\n\nStop the running inferer process.")
-        clear_button = self.make_button(controls, "🧹", self.clear_logs, width=52, bg=self.colors["panel_soft"])
-        clear_button.grid(row=0, column=2, sticky="ew", padx=(0, 8))
+        clear_button = self.make_button(button_bar, "Clear", self.clear_logs, width=72, bg=self.colors["panel_soft"])
+        clear_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
         Tooltip(clear_button, "Clear output\n\nClear the output log.")
         self.auto_restart_var = tk.BooleanVar(value=False)
-        auto_restart = tk.Checkbutton(
-            controls,
-            text="↻",
-            variable=self.auto_restart_var,
-            bg=self.colors["bg"],
-            fg=self.colors["text"],
-            activebackground=self.colors["bg"],
-            activeforeground=self.colors["text"],
-            selectcolor=self.colors["field"],
+        self.auto_restart_button = tk.Button(
+            button_bar,
+            text="AUTO: OFF",
+            command=self.toggle_auto_restart,
+            bg=self.colors["panel_soft"],
+            fg="#ffffff",
+            activebackground=self.colors["accent_hover"],
+            activeforeground="#ffffff",
             relief="flat",
             bd=0,
-            highlightthickness=0,
-            font=("TkDefaultFont", 13, "bold"),
+            padx=10,
+            pady=5,
+            width=9,
+            font=("TkDefaultFont", 10, "bold"),
+            anchor="center",
+            justify="center",
+            cursor="hand2",
         )
-        auto_restart.grid(row=0, column=3, sticky="w", padx=(8, 0))
-        Tooltip(auto_restart, "Auto-restart\n\nRestart the selected inferer automatically if it crashes. Manual Stop will not restart it.")
-        copy_button = self.make_button(controls, "⧉", self.copy_command, width=52, bg=self.colors["panel_soft"])
-        copy_button.grid(row=0, column=4, sticky="ew", padx=(8, 8))
+        self.auto_restart_button.bind("<Enter>", lambda _event: self.auto_restart_button.configure(bg=self.colors["accent_hover"] if self.auto_restart_var.get() else self.colors["border"]))
+        self.auto_restart_button.bind("<Leave>", lambda _event: self.update_auto_restart_button())
+        self.auto_restart_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        Tooltip(self.auto_restart_button, "Auto-restart\n\nRestart the selected inferer automatically if it crashes. Manual Stop will not restart it.")
+        copy_button = self.make_button(button_bar, "Copy", self.copy_command, width=72, bg=self.colors["panel_soft"])
+        copy_button.grid(row=0, column=4, sticky="ew")
         Tooltip(copy_button, "Copy command\n\nCopy the full launch command to the clipboard.")
         self.command_var = tk.StringVar()
         self.command_label = tk.Label(
@@ -931,7 +925,7 @@ class LauncherApp:
             font=("DejaVu Sans Mono", 9),
             height=2,
         )
-        self.command_label.grid(row=0, column=5, columnspan=2, rowspan=2, sticky="ew", padx=(0, 0))
+        self.command_label.grid(row=0, column=1, sticky="ew")
 
         output_panel = self.make_panel(right, padx=14, pady=12)
         output_panel.grid(row=4, column=0, sticky="nsew")
@@ -1078,7 +1072,7 @@ class LauncherApp:
         hover_color = hover or self.colors["accent_hover"]
         button = tk.Button(
             parent,
-            text=text,
+            text=text.upper(),
             command=command,
             bg=base,
             fg="#ffffff",
@@ -1090,11 +1084,24 @@ class LauncherApp:
             pady=5,
             width=max(1, width // 10),
             font=("TkDefaultFont", 10, "bold"),
+            anchor="center",
+            justify="center",
             cursor="hand2",
         )
         button.bind("<Enter>", lambda _event: button.configure(bg=hover_color))
         button.bind("<Leave>", lambda _event: button.configure(bg=base))
         return button
+
+    def toggle_auto_restart(self) -> None:
+        self.auto_restart_var.set(not self.auto_restart_var.get())
+        self.update_auto_restart_button()
+
+    def update_auto_restart_button(self) -> None:
+        button = getattr(self, "auto_restart_button", None)
+        if not button:
+            return
+        enabled = self.auto_restart_var.get()
+        button.configure(text="AUTO: ON" if enabled else "AUTO: OFF", bg=self.colors["accent"] if enabled else self.colors["panel_soft"])
 
     def current_inferer_key(self) -> str:
         if self.inferer_var is None:
@@ -1117,6 +1124,8 @@ class LauncherApp:
         inferer = self.current_inferer()
         if self.inferer_executable_var and not self.inferer_executable_var.get().strip():
             self.inferer_executable_var.set(inferer.executable)
+        if self.current_inferer_key() == "Custom" and self.inferer_executable_entry:
+            self.root.after_idle(lambda: (self.inferer_executable_entry.focus_set(), self.inferer_executable_entry.select_range(0, "end")))
         self.mark_dirty()
         self.render_flags()
         self.update_command_preview()
@@ -1334,14 +1343,14 @@ class LauncherApp:
                     control_frame = entry_parent
                     control_frame.grid(row=0, column=1, sticky="ew")
                     control_frame.columnconfigure(2, weight=1)
-                    minus = self.make_button(control_frame, "➖", lambda f=flag: self.step_numeric_flag(f, -1), width=26, bg=self.colors["panel_soft"])
+                    minus = self.make_button(control_frame, "-", lambda f=flag: self.step_numeric_flag(f, -1), width=26, bg=self.colors["panel_soft"])
                     minus.grid(row=0, column=0, sticky="ew", padx=(0, 4))
                     divide = self.make_button(control_frame, "/", lambda f=flag: self.scale_numeric_flag(f, 0.5), width=26, bg=self.colors["panel_soft"])
                     divide.grid(row=0, column=1, sticky="ew", padx=(0, 4))
                     entry.grid(row=0, column=2, sticky="ew", ipady=6)
-                    multiply = self.make_button(control_frame, "x", lambda f=flag: self.scale_numeric_flag(f, 2), width=26, bg=self.colors["panel_soft"])
+                    multiply = self.make_button(control_frame, "2x", lambda f=flag: self.scale_numeric_flag(f, 2), width=32, bg=self.colors["panel_soft"])
                     multiply.grid(row=0, column=3, sticky="ew", padx=(4, 0))
-                    plus = self.make_button(control_frame, "➕", lambda f=flag: self.step_numeric_flag(f, 1), width=26, bg=self.colors["panel_soft"])
+                    plus = self.make_button(control_frame, "+", lambda f=flag: self.step_numeric_flag(f, 1), width=26, bg=self.colors["panel_soft"])
                     plus.grid(row=0, column=4, sticky="ew", padx=(4, 0))
                     if cfg.step_mode == "power2":
                         Tooltip(minus, "Previous 2^n value\n\nHalve the current value.")
@@ -1367,7 +1376,7 @@ class LauncherApp:
                 )
                 label.grid(row=0, column=1, sticky="w")
                 Tooltip(label, f"{flag} - {cfg.label}\n\n{help_text.get(flag, '')}")
-            remove = self.make_button(cell, "×", lambda f=flag: self.remove_flag(f), width=22, bg=self.colors["panel_soft"])
+            remove = self.make_button(cell, "x", lambda f=flag: self.remove_flag(f), width=22, bg=self.colors["panel_soft"])
             remove.grid(row=0, column=2, sticky="e", padx=(6, 0))
             Tooltip(remove, f"Remove {flag}\n\nHide this flag from the current UI. Add it again with the plus button.")
             self.flag_vars[flag] = values
@@ -1565,10 +1574,8 @@ class LauncherApp:
             exe_name = Path(executable).name
             if self.inferer_executable_var:
                 self.inferer_executable_var.set(executable)
-            if "ik_llama" in executable.lower():
-                self.inferer_var.set("ik_llama.cpp")
-            elif exe_name == "llama-server" and self.inferer_var and self.inferer_var.get() not in self.inferers:
-                self.inferer_var.set("llama.cpp")
+            if self.inferer_var:
+                self.inferer_var.set("llama.cpp" if exe_name == "llama-server" else "Custom")
             tokens = tokens[1:]
 
         alias_to_flag = {
@@ -1931,10 +1938,6 @@ class LauncherApp:
         value = self.model_var.get().strip()
         if value and Path(value).expanduser().exists():
             self.model_meta = parse_gguf(value)
-            mmproj = find_mmproj(value)
-            if mmproj and not self.flags["--mmproj"].value:
-                self.mmproj_var.set(mmproj)
-                self.render_flags()
             for warning in self.model_meta.warnings:
                 self.append_log("warn", warning)
         else:
@@ -2215,6 +2218,16 @@ class LauncherApp:
 
     def _on_right_canvas_resize(self, _event: tk.Event) -> None:
         self.right_canvas.itemconfigure(self.right_window, width=max(1, self.right_canvas.winfo_width()))
+        self.update_right_scrollregion()
+
+    def update_right_scrollregion(self) -> None:
+        if not hasattr(self, "right_canvas") or not hasattr(self, "right_content"):
+            return
+        width = max(1, self.right_canvas.winfo_width())
+        height = max(self.right_content.winfo_reqheight(), self.right_canvas.winfo_height())
+        self.right_canvas.configure(scrollregion=(0, 0, width, height))
+        if self.right_canvas.yview()[0] < 0.001:
+            self.right_canvas.yview_moveto(0.0)
 
     def on_mousewheel(self, event: tk.Event) -> str | None:
         if not hasattr(self, "right_canvas"):

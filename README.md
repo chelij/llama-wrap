@@ -75,7 +75,7 @@ The executable releases are built automatically on GitHub Actions. I can test th
 Use the import button to paste an existing command, for example:
 
 ```bash
-llama-server -m /models/model.gguf -ngl auto -c 32768 --host 127.0.0.1 --port 8123 -fa auto
+llama-server -m /models/model.gguf -ngl auto -c 32768 --host 127.0.0.1 --port 8080 -fa auto
 ```
 
 Recognized flags are loaded into the UI. Unrecognized or advanced flags are preserved in `Extra args`.
