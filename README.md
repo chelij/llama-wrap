@@ -7,7 +7,7 @@ It is not a chat UI. It is a small Tkinter app for building, importing, saving, 
 ## Features
 
 - Browse for model, draft model, and MMProj `.gguf` files.
-- Choose a `llama.cpp`, `ik_llama.cpp`, or custom llama-server-compatible inferer.
+- Choose the default `llama.cpp` inferer or a custom llama-server-compatible executable.
 - Edit common server flags without typing the full command.
 - Add or remove visible flag rows for custom or changing server arguments.
 - Use optional 2^n controls for numeric flags.
@@ -24,7 +24,7 @@ It is not a chat UI. It is a small Tkinter app for building, importing, saving, 
 
 - Python 3.10 or newer.
 - Tkinter for your Python installation.
-- `llama-server` from `llama.cpp`, `ik_llama.cpp`, or another compatible server executable.
+- `llama-server` from `llama.cpp` or another compatible server executable.
 - At least one GGUF model file.
 - Optional smaller draft GGUF model for speculative decoding.
 - Optional MMProj GGUF file for multimodal/vision models.
@@ -97,19 +97,10 @@ llama-server -m /models/mtp.gguf --spec-type draft-mtp --spec-draft-n-max 3
 
 ## Inferers
 
-The inferer selector controls the executable and which optional flags are shown.
+The inferer selector controls the executable.
 
-- `llama.cpp` shows common `llama-server` flags.
-- `ik_llama.cpp` shows common flags plus ik-specific options such as `--fit`, `--fit-margin`, `-mla`, `-fmoe`, `-cram`, `-khad`, and `-vhad`.
-- `Custom` is for other llama-server-compatible executables. Put unsupported or unusual flags in `Extra args`.
-
-When `--fit` is enabled for `ik_llama.cpp`, the launcher does not emit `-ngl`; fit mode chooses GPU layer placement itself.
-
-`ik_llama.cpp` still builds a `llama-server` binary. If it is not in your `PATH`, set the executable field to the full path, for example:
-
-```bash
-/home/you/ik_llama.cpp/build/bin/llama-server
-```
+- `llama.cpp` uses the standard `llama-server` command.
+- `Custom` is for other llama-server-compatible executables. Selecting it focuses the executable field. Put unsupported or unusual flags in `Extra args`.
 
 ## Presets
 
