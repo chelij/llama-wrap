@@ -496,8 +496,8 @@ class LauncherApp:
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("1060x720")
-        self.root.minsize(900, 700)
+        self.root.geometry("1400x720")
+        self.root.minsize(800, 600)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.configure_style()
         self.configure_text_shortcuts()
@@ -645,6 +645,34 @@ class LauncherApp:
             darkcolor=self.colors["accent"],
         )
         style.configure(
+            "Vertical.TScrollbar",
+            troughcolor=self.colors["field"],
+            background=self.colors["panel_soft"],
+            bordercolor=self.colors["border"],
+            arrowcolor=self.colors["text"],
+            lightcolor=self.colors["panel_soft"],
+            darkcolor=self.colors["panel_soft"],
+            width=14,
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
+            troughcolor=self.colors["field"],
+            background=self.colors["panel_soft"],
+            bordercolor=self.colors["border"],
+            arrowcolor=self.colors["text"],
+            lightcolor=self.colors["panel_soft"],
+            darkcolor=self.colors["panel_soft"],
+            width=14,
+        )
+        style.map(
+            "Vertical.TScrollbar",
+            background=[("active", self.colors["border"]), ("pressed", self.colors["muted"])],
+        )
+        style.map(
+            "Horizontal.TScrollbar",
+            background=[("active", self.colors["border"]), ("pressed", self.colors["muted"])],
+        )
+        style.configure(
             "Dark.TCombobox",
             fieldbackground=self.colors["field"],
             background=self.colors["field"],
@@ -687,8 +715,8 @@ class LauncherApp:
 
         body = tk.Frame(self.root, bg=self.colors["bg"], padx=16, pady=16)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, minsize=280)
-        body.columnconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1, minsize=160)
+        body.columnconfigure(1, weight=4)
         body.rowconfigure(0, weight=1)
 
         left = tk.Frame(body, bg=self.colors["panel"], highlightbackground=self.colors["border"], highlightthickness=1)
@@ -722,8 +750,13 @@ class LauncherApp:
         import_button.grid(row=0, column=4, sticky="ew")
         Tooltip(import_button, "Import\n\nPaste a server command and load recognized arguments into the UI.")
 
+        preset_list_frame = tk.Frame(left, bg=self.colors["panel"])
+        preset_list_frame.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        preset_list_frame.rowconfigure(0, weight=1)
+        preset_list_frame.columnconfigure(0, weight=1)
+        preset_xscroll = ttk.Scrollbar(preset_list_frame, orient="horizontal")
         self.preset_list = tk.Listbox(
-            left,
+            preset_list_frame,
             activestyle="none",
             bd=0,
             bg=self.colors["field"],
@@ -735,17 +768,36 @@ class LauncherApp:
             highlightcolor=self.colors["border"],
             font=("TkDefaultFont", 11, "bold"),
             relief="flat",
+            xscrollcommand=preset_xscroll.set,
         )
-        self.preset_list.grid(row=2, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        preset_xscroll.configure(command=self.preset_list.xview)
+        self.preset_list.grid(row=0, column=0, sticky="nsew")
+        preset_xscroll.grid(row=1, column=0, sticky="ew")
+        self.preset_tooltip = Tooltip(self.preset_list, "")
         self.preset_list.bind("<<ListboxSelect>>", self.on_preset_selected)
         self.preset_list.bind("<Double-Button-1>", self.load_selected_preset)
         self.preset_list.bind("<Return>", self.load_selected_preset)
+        self.preset_list.bind("<Motion>", self.update_preset_tooltip)
 
-        right = tk.Frame(body, bg=self.colors["bg"])
-        right.grid(row=0, column=1, sticky="nsew")
+        right_shell = tk.Frame(body, bg=self.colors["bg"])
+        right_shell.grid(row=0, column=1, sticky="nsew")
+        right_shell.columnconfigure(0, weight=1)
+        right_shell.rowconfigure(0, weight=1)
+        self.right_canvas = tk.Canvas(right_shell, bg=self.colors["bg"], highlightthickness=0)
+        self.right_canvas.grid(row=0, column=0, sticky="nsew")
+        right_scrollbar = ttk.Scrollbar(right_shell, orient="vertical", command=self.right_canvas.yview)
+        right_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.right_canvas.configure(yscrollcommand=right_scrollbar.set)
+        right = tk.Frame(self.right_canvas, bg=self.colors["bg"])
+        self.right_window = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(1, weight=1, minsize=200)
         right.rowconfigure(4, weight=2, minsize=150)
+        right.bind("<Configure>", lambda _event: self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all")))
+        self.right_canvas.bind("<Configure>", self._on_right_canvas_resize)
+        self.root.bind_all("<MouseWheel>", self.on_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self.on_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self.on_mousewheel, add="+")
 
         model_panel = self.make_panel(right, padx=14, pady=14)
         model_panel.grid(row=0, column=0, sticky="ew")
@@ -772,27 +824,33 @@ class LauncherApp:
         self.model_entry = self.make_entry(model_panel, self.model_var)
         self.model_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
         self.make_button(model_panel, "Browse", lambda: self.open_file_picker("model"), width=78).grid(row=1, column=3, padx=(8, 0), pady=(10, 0))
-        tk.Label(model_panel, text="MMProj", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
-        )
+        self.mmproj_label = tk.Label(model_panel, text="MMProj", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold"))
+        self.mmproj_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
         self.mmproj_var = tk.StringVar()
         self.mmproj_var.trace_add("write", lambda *_: self.on_mmproj_changed())
         self.mmproj_entry = self.make_entry(model_panel, self.mmproj_var)
         self.mmproj_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
-        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("mmproj"), width=78).grid(row=2, column=3, padx=(8, 0), pady=(10, 0))
-        tk.Label(model_panel, text="Draft", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=3, column=0, sticky="w", padx=(0, 12), pady=(10, 0)
-        )
+        self.mmproj_button = self.make_button(model_panel, "Browse", lambda: self.open_file_picker("mmproj"), width=78)
+        self.mmproj_button.grid(row=2, column=3, padx=(8, 0), pady=(10, 0))
+        self.draft_model_label = tk.Label(model_panel, text="Draft", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold"))
+        self.draft_model_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
         self.draft_model_var = tk.StringVar()
         self.draft_model_var.trace_add("write", lambda *_: self.on_draft_model_changed())
-        draft_entry = self.make_entry(model_panel, self.draft_model_var)
-        draft_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
-        self.make_button(model_panel, "Browse", lambda: self.open_file_picker("draft"), width=78).grid(row=3, column=3, padx=(8, 0), pady=(10, 0))
-        Tooltip(draft_entry, "Draft model\n\nOptional smaller GGUF model for speculative decoding. It is launched with -md/--model-draft.")
+        self.draft_model_entry = self.make_entry(model_panel, self.draft_model_var)
+        self.draft_model_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
+        self.draft_model_button = self.make_button(model_panel, "Browse", lambda: self.open_file_picker("draft"), width=78)
+        self.draft_model_button.grid(row=3, column=3, padx=(8, 0), pady=(10, 0))
+        self.draft_compact = tk.Frame(model_panel, bg=self.colors["panel"])
+        tk.Label(self.draft_compact, text="Draft", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.draft_compact_button = self.make_button(self.draft_compact, "Browse", lambda: self.open_file_picker("draft"), width=78)
+        self.draft_compact_button.grid(row=0, column=1, sticky="w")
+        Tooltip(self.draft_model_entry, "Draft model\n\nOptional smaller GGUF model for speculative decoding. It is launched with -md/--model-draft.")
+        self.update_optional_model_fields()
 
         flags_panel = self.make_panel(right, padx=14, pady=12)
         flags_panel.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
         flags_panel.columnconfigure(0, weight=1)
+        flags_panel.rowconfigure(1, weight=1)
         flags_header = tk.Frame(flags_panel, bg=self.colors["panel"])
         flags_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         flags_header.columnconfigure(0, weight=1)
@@ -805,22 +863,13 @@ class LauncherApp:
         clear_flags_button = self.make_button(flags_header, "🧹", self.clear_flags_to_default, width=34, bg=self.colors["panel_soft"])
         clear_flags_button.grid(row=0, column=2, sticky="e")
         Tooltip(clear_flags_button, "Clear flags\n\nUntick every flag, empty all flag values, and clear Extra args.")
-        self.flags_canvas = tk.Canvas(flags_panel, bg=self.colors["panel"], highlightthickness=0)
-        self.flags_canvas.grid(row=1, column=0, sticky="nsew")
-        self.flags_scrollbar = ttk.Scrollbar(flags_panel, orient="vertical", command=self.flags_canvas.yview)
-        self.flags_scrollbar.grid(row=1, column=1, sticky="ns")
-        self.flags_canvas.configure(yscrollcommand=self.flags_scrollbar.set)
-        self.flags_canvas.bind("<Configure>", self._on_flags_canvas_resize)
-        if os.name == "nt":
-            self.flags_canvas.bind("<MouseWheel>", lambda e: self.flags_canvas.yview_scroll(int(-e.delta / 120), "units"))
-        else:
-            self.flags_canvas.bind("<Button-4>", lambda e: self.flags_canvas.yview_scroll(-1, "units"))
-            self.flags_canvas.bind("<Button-5>", lambda e: self.flags_canvas.yview_scroll(1, "units"))
-        self.flags_frame = tk.Frame(self.flags_canvas, bg=self.colors["panel"])
-        self.flags_canvas.create_window((0, 0), window=self.flags_frame, anchor="nw")
-        self.flags_frame.bind("<Configure>", lambda e: self.flags_canvas.configure(scrollregion=self.flags_canvas.bbox("all")))
-        for col in range(3):
-            self.flags_frame.columnconfigure(col, weight=1, uniform="flag_columns")
+        self.flags_frame = tk.Frame(flags_panel, bg=self.colors["panel"])
+        self.flags_frame.grid(row=1, column=0, sticky="ew")
+        self.flags_frame.bind("<Configure>", self._on_flags_canvas_resize)
+        self._flags_min_cols = 1
+        self._flags_est_cell_width = 380  # px per flag cell
+        self._flags_last_col_count = 0
+        self._configure_flag_columns(3)
         extra_row = tk.Frame(flags_panel, bg=self.colors["panel"])
         extra_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         extra_row.columnconfigure(1, weight=1)
@@ -1225,6 +1274,9 @@ class LauncherApp:
         for child in self.flags_frame.winfo_children():
             child.destroy()
         self.flag_vars.clear()
+        cols = self._flags_col_count()
+        self._configure_flag_columns(cols)
+        self._flags_last_col_count = cols
         items = [(flag, cfg) for flag, cfg in self.flags.items() if flag != "--mmproj" and self.flag_supported_by_current_inferer(flag)]
         help_text = self.flag_help()
         # Sort by group order, then by flag name within group
@@ -1241,9 +1293,9 @@ class LauncherApp:
         }
         items.sort(key=lambda fc: (group_order.get(fc[1].group, 99), fc[0]))
         for idx, (flag, cfg) in enumerate(items):
-            row, col = divmod(idx, 3)
+            row, col = divmod(idx, cols)
             cell = tk.Frame(self.flags_frame, bg=self.colors["panel"])
-            cell.grid(row=row, column=col, sticky="ew", padx=(0, 14) if col < 2 else (0, 0), pady=5)
+            cell.grid(row=row, column=col, sticky="ew", ipadx=7, pady=5)
             cell.columnconfigure(1, weight=1)
             cell.columnconfigure(2, minsize=26)
             enabled_var = tk.BooleanVar(value=cfg.enabled)
@@ -1321,7 +1373,7 @@ class LauncherApp:
             self.flag_vars[flag] = values
         # blank row at bottom for visual breathing room
         padding_row = tk.Frame(self.flags_frame, bg=self.colors["panel"], height=12)
-        padding_row.grid(row=(idx // 3) + 1, column=0, columnspan=3, sticky="ew")
+        padding_row.grid(row=(idx // cols) + 1, column=0, columnspan=cols, sticky="ew")
 
     def clear_flags_to_default(self) -> None:
         for cfg in self.flags.values():
@@ -1347,6 +1399,13 @@ class LauncherApp:
 
     def on_preset_selected(self, _event: tk.Event) -> None:
         return
+
+    def update_preset_tooltip(self, event: tk.Event) -> None:
+        idx = self.preset_list.nearest(event.y)
+        if idx < 0 or idx >= len(self.history.presets):
+            self.preset_tooltip.text = ""
+            return
+        self.preset_tooltip.text = self.history.presets[idx].get("preset_name", "Unnamed")
 
     def load_selected_preset(self, _event: tk.Event | None = None) -> None:
         selection = self.preset_list.curselection()
@@ -1697,6 +1756,8 @@ class LauncherApp:
         self.render_flags()
         self.render_presets()
         self.recalculate_vram()
+        if hasattr(self, "right_canvas"):
+            self.root.after_idle(lambda: self.right_canvas.yview_moveto(0.0))
 
     def open_file_picker(self, target: str) -> None:
         if target == "model":
@@ -1880,7 +1941,36 @@ class LauncherApp:
             self.model_meta = None
         self.recalculate_vram()
 
+    def update_optional_model_fields(self) -> None:
+        if not hasattr(self, "mmproj_entry") or not self.draft_model_var:
+            return
+        mmproj_selected = bool(self.mmproj_var.get().strip())
+        draft_selected = bool(self.draft_model_var.get().strip())
+        self.mmproj_entry.grid_remove()
+        self.draft_model_entry.grid_remove()
+        self.draft_compact.grid_remove()
+        if not mmproj_selected and not draft_selected:
+            self.mmproj_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
+            self.mmproj_button.grid(row=2, column=1, sticky="w", pady=(10, 0))
+            self.draft_model_label.grid_remove()
+            self.draft_model_button.grid_remove()
+            self.draft_compact.grid(row=2, column=2, sticky="w", padx=(14, 0), pady=(10, 0))
+            return
+        self.mmproj_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
+        self.draft_model_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
+        if mmproj_selected:
+            self.mmproj_entry.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
+            self.mmproj_button.grid(row=2, column=3, padx=(8, 0), pady=(10, 0))
+        else:
+            self.mmproj_button.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        if draft_selected:
+            self.draft_model_entry.grid(row=3, column=1, columnspan=2, sticky="ew", pady=(10, 0), ipady=6)
+            self.draft_model_button.grid(row=3, column=3, padx=(8, 0), pady=(10, 0))
+        else:
+            self.draft_model_button.grid(row=3, column=1, sticky="w", pady=(10, 0))
+
     def on_mmproj_changed(self) -> None:
+        self.update_optional_model_fields()
         self.mark_dirty()
         value = self.mmproj_var.get().strip()
         self.flags["--mmproj"].value = value
@@ -1888,6 +1978,7 @@ class LauncherApp:
         self.recalculate_vram()
 
     def on_draft_model_changed(self) -> None:
+        self.update_optional_model_fields()
         self.mark_dirty()
         # When MTP is active the main model carries the draft heads,
         # so a separate draft model is not used.
@@ -2101,10 +2192,49 @@ class LauncherApp:
         self.vram_label_var.set(" ".join(bits))
         self.update_vram_breakdown()
 
-    def _on_flags_canvas_resize(self, event: tk.Event) -> None:
-        if hasattr(self, "flags_frame"):
-            self.flags_frame.configure(width=event.width)
-        self.flags_canvas.configure(scrollregion=self.flags_canvas.bbox("all"))
+    def _configure_flag_columns(self, n: int) -> None:
+        """Set up equal-weight column configs for the flags grid."""
+        existing_cols = self.flags_frame.grid_size()[0]
+        for col in range(max(existing_cols, self._flags_last_col_count, n)):
+            self.flags_frame.columnconfigure(col, weight=0, uniform="")
+        for col in range(n):
+            self.flags_frame.columnconfigure(col, weight=1, uniform="flag_columns")
+
+    def _flags_col_count(self) -> int:
+        """Compute how many flag columns fit in the current flags panel width."""
+        width = self.flags_frame.winfo_width()
+        if width <= 0:
+            return self._flags_min_cols
+        return max(self._flags_min_cols, width // self._flags_est_cell_width)
+
+    def _on_flags_canvas_resize(self, _event: tk.Event) -> None:
+        new_cols = self._flags_col_count()
+        if new_cols != self._flags_last_col_count:
+            self._flags_last_col_count = new_cols
+            self.render_flags()
+
+    def _on_right_canvas_resize(self, _event: tk.Event) -> None:
+        self.right_canvas.itemconfigure(self.right_window, width=max(1, self.right_canvas.winfo_width()))
+
+    def on_mousewheel(self, event: tk.Event) -> str | None:
+        if not hasattr(self, "right_canvas"):
+            return None
+        x1 = self.right_canvas.winfo_rootx()
+        y1 = self.right_canvas.winfo_rooty()
+        x2 = x1 + self.right_canvas.winfo_width()
+        y2 = y1 + self.right_canvas.winfo_height()
+        if not (x1 <= event.x_root <= x2 and y1 <= event.y_root <= y2):
+            return None
+        if getattr(event, "num", None) == 4:
+            delta = -1
+        elif getattr(event, "num", None) == 5:
+            delta = 1
+        else:
+            delta = int(-event.delta / 120) if event.delta else 0
+        if delta:
+            self.right_canvas.yview_scroll(delta, "units")
+            return "break"
+        return None
 
     def draw_vram_bar(self, percent: float | None = None) -> None:
         if not hasattr(self, "vram_bar"):
@@ -2365,7 +2495,8 @@ class LauncherApp:
     def update_status_from_log(self, text: str) -> None:
         if self.model_loaded:
             return
-        if "main: model loaded" in text.lower():
+        lower = text.lower()
+        if "main: model loaded" in lower or "server is listening on" in lower or "all slots are idle" in lower:
             self.model_loaded = True
             if self.process and self.process.poll() is None:
                 self.set_status("Running")
