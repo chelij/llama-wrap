@@ -1,63 +1,99 @@
 # llama-wrap
 
-`llama-wrap` is a lightweight desktop launcher for `llama-server` arguments.
+`llama-wrap` is a lightweight launcher for `llama-server` — available as both a **desktop GUI** (Tkinter) and an **interactive CLI** (zero dependencies).
 
-It is not a chat UI. It is a small Tkinter app for building, importing, saving, and running `llama-server`-compatible commands with GGUF models.
+It is not a chat UI. It is a tool for building, importing, saving, and running `llama-server`-compatible commands with GGUF models.
 
 ## Features
 
-- Browse for model, draft model, and MMProj `.gguf` files.
-- Choose the default `llama.cpp` inferer or a custom llama-server-compatible executable.
-- Edit common server flags without typing the full command.
-- Add or remove visible flag rows for custom or changing server arguments.
-- Use optional 2^n controls for numeric flags.
-- Paste an existing server command and import recognized values into the UI.
-- Put advanced or uncommon options in `Extra args`.
-- Save and reload launch presets.
-- View live server output.
-- Show launch status, including model-loaded detection.
-- Show lightweight tokens/second from server log lines when available.
-- Optionally restart the server after a crash.
-- Show a rough VRAM estimate and breakdown.
+- **GUI & CLI** — use the desktop launcher or the terminal, whichever fits your workflow.
+- **Browse** for model, draft model, and MMProj `.gguf` files.
+- **Choose** the default `llama.cpp` inferer or a custom llama-server-compatible executable.
+- **Edit** common server flags without typing the full command — or add custom flag rows.
+- **2ⁿ step controls** for numeric flags.
+- **Import** an existing server command and parse recognized values into the UI.
+- **Presets** — save, reload, rename, and delete launch configurations.
+- **Session stats** — average TTFT (ms) and average tok/s are tracked across the session and saved to each preset. Accurate via the auto-enabled `--metrics` endpoint.
+- **Auto-restart** — optionally restart the server after a crash, with a visible restart counter.
+- **Live output** — view server logs in the GUI or piped to the terminal in the CLI.
+- **VRAM estimate** — model-aware breakdown of GPU memory usage.
+- **Interactive CLI browser** — select presets by number, edit flags with tab completion, and launch with a single keypress.
 
 ## Requirements
 
 - Python 3.10 or newer.
-- Tkinter for your Python installation.
+- Tkinter (for the GUI mode; the CLI does not need it).
 - `llama-server` from `llama.cpp` or another compatible server executable.
 - At least one GGUF model file.
 - Optional smaller draft GGUF model for speculative decoding.
 - Optional MMProj GGUF file for multimodal/vision models.
 
-The selected executable must be available in your `PATH`, or entered as a full path in the executable field.
-
-```bash
-llama-server --help
-```
-
-If that command works, `llama-wrap` should be able to launch the default `llama.cpp` profile.
-
-## Python Dependencies
-
-There are no third-party Python package dependencies.
-
-`llama-wrap` uses only the Python standard library. `requirements.txt` is intentionally empty except for a note.
-
 ## Run
 
-From source:
+### GUI
 
 ```bash
 python llamawrap.py
 ```
 
-From a release download, extract the archive first, then run the executable for your platform:
+### CLI (interactive browser)
 
-- Windows: run `llama-wrap.exe`.
-- macOS: open `llama-wrap.app` or run the packaged `llama-wrap` executable.
-- Linux: run `./llama-wrap`.
+```bash
+python llamawrap-cli.py
+```
 
-The executable releases are built automatically on GitHub Actions. I can test the Linux build locally, but I cannot personally test the Windows and macOS release builds.
+The CLI opens an interactive browser — just select a preset by number, then choose an action:
+
+```
+  s     show full details
+  f     edit flags
+  r     run (launch server)
+  a     run with auto-restart on crash
+  d     delete this preset
+  b     back to list
+```
+
+### CLI (direct commands)
+
+```bash
+llamawrap-cli list
+llamawrap-cli show "My Preset"
+llamawrap-cli run "My Preset" --auto
+llamawrap-cli set "My Preset" --port 8080
+llamawrap-cli enable "My Preset" --jinja
+llamawrap-cli disable "My Preset" -ngl
+llamawrap-cli rename "Old Name" "New Name"
+llamawrap-cli help run
+```
+
+### Release builds
+
+Extract the archive for your platform and run:
+
+- **Windows:** `llama-wrap.exe`
+- **macOS:** open `llama-wrap.app` or run the packaged `llama-wrap` executable
+- **Linux:** `./llama-wrap`
+
+The CLI (`llamawrap-cli.py`) is not packaged into the binary — run it directly with Python from a source checkout.
+
+## Session Stats
+
+Every time you run a preset, `llama-wrap` tracks:
+
+- **Average TTFT** (Time To First Token) — accumulated from each request's prompt eval time.
+- **Average Tok/s** — weighted average across all generation steps.
+
+These are computed from the server's `/metrics` endpoint (auto-enabled) and saved to the preset on stop. The `Last:` line in the CLI or "Last session:" label in the GUI shows them at a glance.
+
+```
+Last:  53.1ms TTFT | 41.51 tok/s
+```
+
+With auto-restart, stats accumulate across all restarts and a restart counter is shown:
+
+```
+Last:  53.1ms TTFT | 41.51 tok/s | 3 restarts
+```
 
 ## Basic Usage
 
@@ -70,70 +106,58 @@ The executable releases are built automatically on GitHub Actions. I can test th
 7. Watch the output panel for logs.
 8. Save the setup as a preset if you want to reuse it.
 
+## Presets
+
+Presets are stored in `history.json` next to `llamawrap.py` when running from source, or next to the launcher binary in release builds.
+
+Each preset stores:
+
+- model path, MMProj path, draft model path
+- enabled flags and their values
+- custom and hidden flag rows
+- extra args
+- selected inferer and executable
+- **session stats** from the last run (TTFT avg, tok/s avg, restart count)
+
+Recent run commands are also saved.
+
+The CLI's `list` and `show` commands display everything in a compact format.
+
+## CLI Tab Completion
+
+In the CLI's interactive flag editor (`f`), tab completion is available:
+
+- `ena` + Tab → `enable`
+- `enable --p` + Tab → `--port`, `--presence-penalty`, etc.
+- `set -n` + Tab → `-ngl`, `-np`, etc.
+- Works for `enable`, `disable`, `rmflag`, and `set`.
+
 ## Importing Commands
 
-Use the import button to paste an existing command, for example:
+Use the import button (GUI) to paste an existing server command:
 
 ```bash
-llama-server -m /models/model.gguf -ngl auto -c 32768 --host 127.0.0.1 --port 8080 -fa auto
+llama-server -m /models/model.gguf -ngl all -c 32768 --host 127.0.0.1 --port 8080
 ```
 
-Recognized flags are loaded into the UI. Unrecognized or advanced flags are preserved in `Extra args`.
-
-Custom flags pasted from a command are added as editable flag rows when possible.
-
-## Draft Models
-
-The `Draft` field adds `-md` / `--model-draft` for speculative decoding. This uses a smaller model beside the main model to propose tokens that the main model verifies.
-
-For MTP/self-speculative models, enable `--spec-type` and use `draft-mtp` for current llama.cpp builds. Some older MTP branches used `mtp`, so the launcher keeps both values selectable.
-
-Example:
-
-```bash
-llama-server -m /models/large.gguf -md /models/small-draft.gguf --spec-draft-n-max 16
-llama-server -m /models/mtp.gguf --spec-type draft-mtp --spec-draft-n-max 3
-```
+Recognized flags are loaded into the UI. Unrecognized flags stay in `Extra args`. Custom flags are added as editable rows.
 
 ## Inferers
 
-The inferer selector controls the executable.
-
-- `llama.cpp` uses the standard `llama-server` command.
-- `Custom` is for other llama-server-compatible executables. Selecting it focuses the executable field. Put unsupported or unusual flags in `Extra args`.
-
-## Presets
-
-Presets are stored in `history.json` next to `llamawrap.py` when running from source, or next to the packaged launcher when running a release build.
-
-Presets include:
-
-- model path
-- MMProj path
-- draft model path
-- enabled flags and values
-- custom and removed flag rows
-- extra args
-- selected inferer and executable
-
-Recent run commands are also stored in `history.json`.
-
-Loaded presets require double-click or Enter. If the selected preset has unsaved changes, `*` is shown beside its name. Saving a changed selected preset updates it without asking for the name again.
+- `llama.cpp` uses the standard `llama-server` executable.
+- `Custom` is for other llama-server-compatible executables. Selecting it auto-focuses the executable field.
 
 ## VRAM Estimate
 
-The VRAM display is an estimate, not a guarantee.
-
-It uses model file size, parsed GGUF metadata when available, context size (`-c`), KV cache type, GPU layers, draft model size, MMProj size, and a runtime overhead estimate. Sizes are shown in binary units such as MiB and GiB.
-
-If GGUF metadata cannot be read, launching can still work, but the estimate may be less accurate.
+The VRAM display is an estimate based on model file size, parsed GGUF metadata, context size (`-c`), KV cache type, GPU layers, draft model size, MMProj size, and runtime overhead. Shown in binary units (MiB, GiB).
 
 ## Notes
 
 - This app does not download models.
 - This app does not manage chat conversations.
 - This app does not replace Open WebUI, LM Studio, or the built-in llama.cpp Web UI.
-- It is intended as a small local process wrapper for people who already use llama-server-compatible inferers.
+- It is a small local process wrapper for people who already use llama-server-compatible inferers.
+- `--metrics` is automatically added to every launch for accurate session stats. The `/metrics` endpoint is available at `http://127.0.0.1:<port>/metrics`.
 
 ## Support
 
