@@ -65,6 +65,7 @@ class GGUFMetadata:
     n_kv_heads: int = 0
     n_embd_k_gqa: int = 0
     n_embd_v_gqa: int = 0
+    sliding_window: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -168,7 +169,7 @@ def read_gguf_value(data: bytes, offset: int, value_type: int) -> tuple[Any, int
         count = struct.unpack_from("<Q", data, offset + 4)[0]
         offset += 12
         values = []
-        if count > 128:
+        if count > 1024:
             raise ValueError("large metadata array skipped")
         for _ in range(count):
             value, offset = read_gguf_value(data, offset, item_type)
@@ -200,28 +201,40 @@ def skip_gguf_value(data: bytes, offset: int, value_type: int) -> int:
         if offset + 8 > len(data):
             raise ValueError("metadata string extends past scanned header")
         length = struct.unpack_from("<Q", data, offset)[0]
-        offset += 8 + length
-        if offset > len(data):
+        offset += 8
+        if length > len(data) - offset:
             raise ValueError("metadata string extends past scanned header")
-        return offset
+        return offset + length
     if value_type == 9:
         if offset + 12 > len(data):
             raise ValueError("metadata array extends past scanned header")
         item_type = struct.unpack_from("<I", data, offset)[0]
         count = struct.unpack_from("<Q", data, offset + 4)[0]
         offset += 12
-        item_size = scalar_sizes.get(item_type)
-        if item_size is not None:
-            offset += count * item_size
-            if offset > len(data):
-                raise ValueError("metadata array extends past scanned header")
-            return offset
         for _ in range(count):
-            offset = skip_gguf_value(data, offset, item_type)
+            if item_type == 8:
+                # String: 8-byte length + string bytes
+                s_len = struct.unpack_from("<Q", data, offset)[0]
+                offset += 8 + s_len
+            elif item_type == 9:
+                # Nested array
+                offset = skip_gguf_value(data, offset, item_type)
+            elif item_type == 0: offset += 1
+            elif item_type == 1: offset += 1
+            elif item_type == 2: offset += 2
+            elif item_type == 3: offset += 2
+            elif item_type == 4: offset += 4
+            elif item_type == 5: offset += 4
+            elif item_type == 6: offset += 4
+            elif item_type == 7: offset += 1
+            elif item_type == 10: offset += 8
+            elif item_type == 11: offset += 8
+            elif item_type == 12: offset += 8
+            else: offset += 4
         return offset
     size = scalar_sizes.get(value_type)
     if size is None:
-        raise ValueError("metadata format is newer than this launcher understands")
+        return offset + 8  # Skip a default amount for unknown types
     offset += size
     if offset > len(data):
         raise ValueError("metadata value extends past scanned header")
@@ -272,6 +285,7 @@ def parse_gguf(path: str) -> GGUFMetadata:
                     "attention.head_count_kv",
                     "n_head_kv",
                     "n_kv_heads",
+                    "attention.sliding_window",
                 ),
             )
             if is_relevant:
@@ -279,17 +293,30 @@ def parse_gguf(path: str) -> GGUFMetadata:
             else:
                 offset = skip_gguf_value(data, offset, value_type)
                 continue
+            def to_int(v):
+                if isinstance(v, list) and v:
+                    return int(v[0])
+                return int(v)
             if metadata_key_matches(key, ("block_count", "n_layers", "n_layer")):
-                meta.n_layers = int(value)
+                meta.n_layers = to_int(value)
             elif metadata_key_matches(key, ("embedding_length", "n_embd")):
-                meta.n_embd = int(value)
+                meta.n_embd = to_int(value)
             elif metadata_key_matches(key, ("attention.key_length", "n_embd_head_k", "n_embd_k_gqa")):
-                meta.n_embd_k_gqa = int(value)
+                meta.n_embd_k_gqa = to_int(value)
             elif metadata_key_matches(key, ("attention.value_length", "n_embd_head_v", "n_embd_v_gqa")):
-                meta.n_embd_v_gqa = int(value)
+                meta.n_embd_v_gqa = to_int(value)
             elif metadata_key_matches(key, ("attention.head_count_kv", "n_head_kv", "n_kv_heads")):
-                meta.n_kv_heads = int(value)
-            if meta.n_layers and meta.n_embd and meta.n_kv_heads and meta.n_embd_k_gqa and meta.n_embd_v_gqa:
+                meta.n_kv_heads = to_int(value)
+            elif metadata_key_matches(key, ("attention.sliding_window",)):
+                meta.sliding_window = to_int(value)
+            
+            # Keep looking for sliding_window even if core metrics are found
+            core_found = meta.n_layers and meta.n_embd and meta.n_kv_heads and meta.n_embd_k_gqa and meta.n_embd_v_gqa
+            if core_found and meta.sliding_window:
+                break
+            if core_found and metadata_key_matches(key, ("attention.sliding_window",)):
+                pass # continue to next to find sliding window
+            elif core_found:
                 break
     except Exception:
         meta.warnings.append("The launcher could not read all model metadata. Launching should still work, but the VRAM estimate may be less accurate.")
@@ -1781,9 +1808,9 @@ class LauncherApp:
                 parts.append(f"{stats['avg_tok_s']} tok/s")
             if stats.get("auto_restarts", 0):
                 parts.append(f"{stats['auto_restarts']} restarts")
-            self._saved_stats_var.set("Last session: " + " | ".join(parts))
+            self._session_stats_var.set("Last session: " + " | ".join(parts))
         else:
-            self._saved_stats_var.set("")
+            self._session_stats_var.set("")
         if hasattr(self, "right_canvas"):
             self.root.after_idle(lambda: self.right_canvas.yview_moveto(0.0))
 
@@ -2004,15 +2031,8 @@ class LauncherApp:
     def on_draft_model_changed(self) -> None:
         self.update_optional_model_fields()
         self.mark_dirty()
-        # When MTP is active the main model carries the draft heads,
-        # so a separate draft model is not used.
-        spec_type_val = str(self.flags.get("--spec-type", object()).value).strip().lower() if "--spec-type" in self.flags and self.flags["--spec-type"].enabled else ""
-        mtp_active = any(t.strip() in ("mtp", "draft-mtp") for t in spec_type_val.split(",") if t.strip())
         value = self.draft_model_var.get().strip() if self.draft_model_var else ""
-        if mtp_active and value:
-            self.append_log("warn", "Draft model ignored: MTP (--spec-type draft-mtp/mtp) uses built-in heads.")
-            self.draft_model_meta = None
-        elif value and Path(value).expanduser().exists():
+        if value and Path(value).expanduser().exists():
             self.draft_model_meta = parse_gguf(value)
             for warning in self.draft_model_meta.warnings:
                 self.append_log("warn", warning)
@@ -2122,20 +2142,24 @@ class LauncherApp:
         v_bytes = KV_BYTES.get(ctv_value, 0.5)
         k_dim = meta.n_embd_k_gqa if meta and meta.n_embd_k_gqa else 0
         v_dim = meta.n_embd_v_gqa if meta and meta.n_embd_v_gqa else 0
+
+        # Sliding Window Attention: if the model has a sliding window, only
+        # that many tokens are cached per SWA layer instead of the full context.
+        # We use it as the effective context size for the estimate.
+        sw = meta.sliding_window if meta and meta.sliding_window else 0
+        effective_ctx = sw if sw > 0 else context
+
         if k_dim and v_dim:
-            kv_cache = context * n_layers * ((k_dim * k_bytes) + (v_dim * v_bytes))
+            kv_cache = effective_ctx * n_layers * ((k_dim * k_bytes) + (v_dim * v_bytes))
         elif n_embd:
             fallback_dim = n_embd / max(1, n_kv_heads)
-            kv_cache = context * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
+            kv_cache = effective_ctx * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
         else:
             fallback_dim = 128.0
             k_dim = int(fallback_dim)
             v_dim = int(fallback_dim)
-            kv_cache = context * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
+            kv_cache = effective_ctx * n_layers * ((fallback_dim * k_bytes) + (fallback_dim * v_bytes))
         # -- MTP speculative KV cache --
-        # draft-mtp / mtp uses built-in heads; no separate draft model needed.
-        # During generation each step produces n_draft speculative tokens that
-        # need temporary KV slots on every layer, so peak VRAM adds that extra KV.
         mtp_kv = 0.0
         mtp_active = False
         spec_type_val = str(self.flags.get("--spec-type", object()).value).strip().lower() if "--spec-type" in self.flags and self.flags["--spec-type"].enabled else ""
@@ -2155,9 +2179,8 @@ class LauncherApp:
         mmproj_path = self.flags["--mmproj"].value
         if self.flags["--mmproj"].enabled and mmproj_path and Path(mmproj_path).expanduser().exists():
             mmproj_size = float(Path(mmproj_path).expanduser().stat().st_size)
-        # When MTP is active the main model carries the draft heads; a separate
-        # draft model is not used, so skip counting its weight.
-        draft_size = 0.0 if mtp_active else (float(self.draft_model_meta.size) if self.draft_model_meta else 0.0)
+        # Draft model size (always counted if present, even under MTP when using -md)
+        draft_size = float(self.draft_model_meta.size) if self.draft_model_meta else 0.0
         weights = (min(ngl, total_layers) / total_layers) * model_size
         overhead = 0.0
         if model_size:
@@ -2327,11 +2350,13 @@ class LauncherApp:
             f"Overhead {human_bytes(self.estimate.get('overhead', 0.0))}",
         ])
         legend = "Model blue + Context yellow + MTP KV pink + Draft purple + MMProj green + Overhead red\n"
+        meta = self.model_meta
+        sw_text = f" | SWA: {meta.sliding_window} (KV est. uses SWA window)" if meta and meta.sliding_window else ""
         self.vram_breakdown_var.set(
             legend
             + " + ".join(parts)
             + f" = {human_bytes(self.estimate.get('estimated', 0.0))}\n"
-            + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {confidence}"
+            + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {confidence}{sw_text}"
         )
 
     def build_command(self, validate_model: bool = True) -> list[str]:
