@@ -4,6 +4,8 @@
 
 It is not a chat UI. It is a tool for building, importing, saving, and running `llama-server`-compatible commands with GGUF models.
 
+![llama-wrap screenshot](screenshot.png)
+
 ## Features
 
 - **GUI & CLI** — use the desktop launcher or the terminal, whichever fits your workflow.
