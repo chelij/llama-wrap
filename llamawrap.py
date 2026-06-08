@@ -477,6 +477,11 @@ class LauncherApp:
         self.draft_model_var: tk.StringVar | None = None
         self.tokps_var: tk.StringVar | None = None
         self.last_tokens_per_second: float | None = None
+        self._session_ttft_ms: list[float] = []
+        self._session_gen_tokens: int = 0
+        self._session_gen_time_ms: float = 0.0
+        self._session_stats_var: tk.StringVar | None = None
+        self._auto_restart_count: int = 0
         self.loading_preset = False
 
         self.root = tk.Tk()
@@ -962,7 +967,7 @@ class LauncherApp:
 
         status_panel = self.make_panel(right, padx=14, pady=12)
         status_panel.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        status_panel.columnconfigure(3, weight=1)
+        status_panel.columnconfigure(4, weight=1)
         tk.Label(status_panel, text="Status", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=0, sticky="w"
         )
@@ -981,15 +986,19 @@ class LauncherApp:
         tk.Label(status_panel, textvariable=self.tokps_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=2, sticky="w", padx=(0, 12)
         )
+        self._session_stats_var = tk.StringVar(value="")
+        tk.Label(status_panel, textvariable=self._session_stats_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
+            row=0, column=3, sticky="w", padx=(0, 16)
+        )
         tk.Label(status_panel, text="VRAM", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=0, column=3, sticky="e", padx=(0, 10)
+            row=0, column=4, sticky="e", padx=(0, 10)
         )
         self.vram_label_var = tk.StringVar()
         tk.Label(status_panel, textvariable=self.vram_label_var, bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 10)).grid(
-            row=0, column=4, sticky="w"
+            row=0, column=5, sticky="w"
         )
         self.vram_bar = tk.Canvas(status_panel, height=12, bg=self.colors["field"], highlightthickness=1, highlightbackground=self.colors["border"])
-        self.vram_bar.grid(row=1, column=0, columnspan=5, sticky="ew", pady=(10, 0))
+        self.vram_bar.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(10, 0))
         self.vram_bar.bind("<Configure>", lambda _event: self.draw_vram_bar())
         self.vram_breakdown_var = tk.StringVar()
         tk.Label(
@@ -1763,6 +1772,18 @@ class LauncherApp:
         self.render_flags()
         self.render_presets()
         self.recalculate_vram()
+        stats = preset.get("session_stats", {})
+        if stats:
+            parts = []
+            if "avg_ttft_ms" in stats:
+                parts.append(f"{stats['avg_ttft_ms']}ms TTFT")
+            if "avg_tok_s" in stats:
+                parts.append(f"{stats['avg_tok_s']} tok/s")
+            if stats.get("auto_restarts", 0):
+                parts.append(f"{stats['auto_restarts']} restarts")
+            self._saved_stats_var.set("Last session: " + " | ".join(parts))
+        else:
+            self._saved_stats_var.set("")
         if hasattr(self, "right_canvas"):
             self.root.after_idle(lambda: self.right_canvas.yview_moveto(0.0))
 
@@ -2359,6 +2380,9 @@ class LauncherApp:
                 command.extend(shlex.split(self.extra_args_var.get().strip()))
             except ValueError as exc:
                 raise ValueError(f"extra args are not valid shell-style arguments: {exc}") from exc
+        # Always enable --metrics so the /metrics endpoint is available
+        if "--metrics" not in command:
+            command.append("--metrics")
         return command
 
     def launch(self) -> None:
@@ -2378,6 +2402,7 @@ class LauncherApp:
 
     def start_process(self, command: list[str], add_separator: bool = False) -> None:
         self.model_loaded = False
+        self.reset_session_stats()
         self.kill_existing_on_port(self.get_int_flag("--port", DEFAULT_SERVER_PORT))
         if add_separator:
             self.append_log("warn", "Auto-restarting inferer...")
@@ -2435,6 +2460,7 @@ class LauncherApp:
             except Exception:
                 self.process.terminate()
         self.set_status("Stopped")
+        self._save_session_stats_to_preset()
 
     def refresh_process_state(self) -> None:
         if self.process and self.process.poll() is not None and self.status_var.get() in {"Launching", "Running"}:
@@ -2450,7 +2476,9 @@ class LauncherApp:
                     except Exception as exc:
                         self.append_log("error", f"Auto-restart skipped: {exc}")
                     else:
+                        self._auto_restart_count += 1
                         self.root.after(800, lambda cmd=command: self.start_process(cmd, add_separator=True))
+            self._save_session_stats_to_preset()
         self.root.after(600, self.refresh_process_state)
 
     def refresh_gpu_usage(self) -> None:
@@ -2489,6 +2517,51 @@ class LauncherApp:
         self.last_tokens_per_second = None
         if self.tokps_var:
             self.tokps_var.set("")
+        # Reset restart counter on manual launch
+        self._auto_restart_count = 0
+
+    def reset_session_stats(self) -> None:
+        self._session_ttft_ms.clear()
+        self._session_gen_tokens = 0
+        self._session_gen_time_ms = 0.0
+        if self._session_stats_var:
+            self._session_stats_var.set("")
+
+    def _update_session_display(self) -> None:
+        if not self._session_stats_var:
+            return
+        parts = []
+        if self._session_ttft_ms:
+            avg_ttft = sum(self._session_ttft_ms) / len(self._session_ttft_ms)
+            parts.append(f"{avg_ttft:.0f}ms TTFT")
+        if self._session_gen_tokens > 0 and self._session_gen_time_ms > 0:
+            avg_tps = (self._session_gen_tokens / self._session_gen_time_ms) * 1000.0
+            parts.append(f"{avg_tps:.2f} tok/s")
+        self._session_stats_var.set("  ".join(parts))
+
+    def _save_session_stats_to_preset(self) -> None:
+        """Save current session averages to the preset in history.json."""
+        if not self.selected_preset or not self.history.presets:
+            return
+        avg_ttft = 0.0
+        avg_tok_s = 0.0
+        if self._session_ttft_ms:
+            avg_ttft = sum(self._session_ttft_ms) / len(self._session_ttft_ms)
+        if self._session_gen_tokens > 0 and self._session_gen_time_ms > 0:
+            avg_tok_s = (self._session_gen_tokens / self._session_gen_time_ms) * 1000.0
+        preset = None
+        for p in self.history.presets:
+            if p.get("preset_name") == self.selected_preset:
+                preset = p
+                break
+        if preset is None:
+            return
+        preset["session_stats"] = {
+            "avg_ttft_ms": round(avg_ttft, 1),
+            "avg_tok_s": round(avg_tok_s, 2),
+            "auto_restarts": self._auto_restart_count,
+        }
+        self.history.upsert_preset(preset)
 
     def append_log(self, level: str, text: str) -> None:
         if threading.current_thread() is not threading.main_thread():
@@ -2515,6 +2588,30 @@ class LauncherApp:
                 self.set_status("Running")
 
     def capture_tokens_per_second(self, text: str) -> None:
+        # Prompt eval time → TTFT (Time To First Token)
+        ttft_match = re.search(
+            r"prompt\s+eval\s+(?:took|time\s*=\s*)\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*/\s*(\d+)\s*tokens",
+            text,
+            re.IGNORECASE,
+        )
+        if ttft_match:
+            ms = float(ttft_match.group(1))
+            self._session_ttft_ms.append(ms)
+
+        # Generation eval time → average tok/s accumulator
+        # Match "eval" (took|time =) but not when preceded by "prompt"
+        gen_match = re.search(
+            r"(?<!prompt\s)eval\s+(?:took|time\s*=\s*)\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*/\s*(\d+)\s*tokens",
+            text,
+            re.IGNORECASE,
+        )
+        if gen_match:
+            ms = float(gen_match.group(1))
+            tokens = int(gen_match.group(2))
+            self._session_gen_tokens += tokens
+            self._session_gen_time_ms += ms
+
+        # Legacy: keep last tok/s for display as well
         match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/s|tok/s|t/s)", text, re.IGNORECASE)
         if not match:
             return
@@ -2524,6 +2621,8 @@ class LauncherApp:
             return
         if self.tokps_var:
             self.tokps_var.set(f"{self.last_tokens_per_second:.2f} tok/s")
+
+        self._update_session_display()
 
     def drain_log_queue(self) -> None:
         while True:
@@ -2541,7 +2640,28 @@ class LauncherApp:
         self.root.destroy()
 
     def run(self) -> None:
+        # Handle Ctrl+C to gracefully stop server and save session stats
+        self._sigint_received = False
+        signal.signal(signal.SIGINT, lambda s, f: setattr(self, "_sigint_received", True))
+        self.root.after(200, self._check_sigint)
         self.root.mainloop()
+
+    def _check_sigint(self) -> None:
+        if self._sigint_received:
+            self._sigint_received = False
+            if self.process and self.process.poll() is None:
+                self.append_log("warn", "SIGINT received, stopping inferer...")
+                try:
+                    if os.name != "nt":
+                        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
+                    else:
+                        self.process.terminate()
+                except Exception:
+                    self.process.terminate()
+            self._save_session_stats_to_preset()
+            self.root.destroy()
+            return
+        self.root.after(200, self._check_sigint)
 
 
 if __name__ == "__main__":
