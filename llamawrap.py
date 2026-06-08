@@ -25,6 +25,49 @@ DEFAULT_SERVER_PORT = 8080
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 HISTORY_FILE = APP_DIR / "history.json"
 GB = 1024**3
+
+# Known llama-server flags for the "Add flag" suggestion dropdown.
+# These are NOT a hardcoded UI — they only appear as autocomplete hints
+# when a user clicks + to add a custom flag.
+KNOWN_LLAMA_FLAGS: tuple[str, ...] = (
+    "--no-webui", "--embedding", "--log-file", "--log-format", "--log-level",
+    "--log-colors", "--cont-batching", "--slot-save-file", "--listen",
+    "--ssl-file-key", "--ssl-file-cert", "--api-key", "--slots",
+    "--endpoint", "--endpoint-file",
+    "--chat-template", "--chat-template-kwargs", "--jinja", "--jinja++",
+    "--grp-attn-n", "--grp-attn-w", "--rope-scaling", "--rope-freq-base",
+    "--rope-freq-scale", "--rope-scaling-type", "--rope-freq-scale-policy",
+    "--rope-freq-scale-fill", "--yarn-orig-ctx", "--yarn-ext-factor",
+    "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow",
+    "--no-mmap", "--numa", "--tensor-split", "--main-gpu",
+    "--split-mode", "--gpu-device", "--mlock",
+    "--samplers", "--sparams", "--temp", "--top-k", "--top-p",
+    "--min-p", "--xtc-probability", "--xtc-threshold", "--typical-p",
+    "--repeat-last-n", "--repeat-penalty", "--frequency-penalty",
+    "--presence-penalty", "--dry-multiplier", "--dry-base",
+    "--dry-allowed-length", "--dry-penalty-last-n",
+    "--mirostat", "--mirostat-lr", "--mirostat-ent",
+    "--dynatemp-range", "--dynatemp-exp",
+    "--seed", "--prompt-cache", "--prompt-cache-all",
+    "--prompt-cache-ro", "--keep", "--batch-seq-len",
+    "--gen-sec", "--n-predict", "--predict",
+    "--ignore-eos", "--interactive", "--interactive-first",
+    "--in-prefix", "--in-suffix", "--reverse-prompt",
+    "--speculative-ngram", "--spec-type", "--spec-draft-n-max",
+    "--spec-draft-p-min", "--draft", "--model-draft",
+    "--multiline-input", "--simple-io", "--cb-style",
+    "--verbose", "--no-display-prompt",
+    "--prio", "--prio-pointer-fp16",
+    "--offload-kqv", "--no-kqv-offload",
+    "--memory-f32", "--memory-float",
+    "--ctx-evict", "--cache-reuse",
+    "--dont-evict",
+    "--spm", "--grammar", "--grammar-file",
+    "--ppl-output-token-prob",
+    "--check-tensors", "--override-kv",
+    "--lora", "--lora-base",
+    "--control-vector", "--control-vector-scaled-cn",
+)
 KV_BYTES = {
     "f32": 4.0,
     "f16": 2.0,
@@ -94,7 +137,12 @@ class HistoryStore:
             self.save()
 
     def save(self) -> None:
-        data = {"presets": self.presets, "runs": self.runs[-100:], "settings": self.settings}
+        data = {
+            "format_version": 1,
+            "presets": self.presets,
+            "runs": self.runs[-100:],
+            "settings": self.settings,
+        }
         self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def set_setting(self, key: str, value: Any) -> None:
@@ -457,8 +505,8 @@ class Tooltip:
             self.window,
             text=self.text,
             justify="left",
-            bg="#0b1018",
-            fg="#e6edf3",
+            bg="#131721",
+            fg="#f0f2f5",
             relief="solid",
             bd=1,
             padx=10,
@@ -623,12 +671,12 @@ class LauncherApp:
 
     def configure_style(self) -> None:
         self.colors = {
-            "bg": "#0e1117",
-            "panel": "#161b22",
-            "panel_soft": "#1c222c",
-            "field": "#0f141c",
-            "border": "#2b3442",
-            "text": "#e6edf3",
+            "bg": "#0a0d14",
+            "panel": "#131721",
+            "panel_soft": "#1a1f2e",
+            "field": "#0d1117",
+            "border": "#283040",
+            "text": "#f0f2f5",
             "muted": "#8b949e",
             "accent": "#2f81f7",
             "accent_hover": "#1f6feb",
@@ -643,6 +691,9 @@ class LauncherApp:
             "warn": "#d29922",
             "import": "#8957e5",
             "import_hover": "#a371f7",
+            "conf_green": "#3fb950",
+            "conf_yellow": "#d29922",
+            "conf_red": "#ff7b72",
         }
         self.root.configure(bg=self.colors["bg"])
         style = ttk.Style(self.root)
@@ -721,10 +772,10 @@ class LauncherApp:
         self.root.bind("<Control-s>", lambda _event: self.save_current_preset() or "break")
 
     def build_ui(self) -> None:
-        top_bar = tk.Frame(self.root, bg="#090c10", height=54)
+        top_bar = tk.Frame(self.root, bg="#080b12", height=54)
         top_bar.pack(fill="x")
         top_bar.pack_propagate(False)
-        tk.Label(top_bar, text=APP_TITLE, bg="#090c10", fg=self.colors["text"], font=("TkDefaultFont", 15, "bold")).pack(side="left", padx=18)
+        tk.Label(top_bar, text=APP_TITLE, bg="#080b12", fg=self.colors["text"], font=("TkDefaultFont", 15, "bold")).pack(side="left", padx=18)
 
         body = tk.Frame(self.root, bg=self.colors["bg"], padx=16, pady=16)
         body.pack(fill="both", expand=True)
@@ -1024,8 +1075,13 @@ class LauncherApp:
         tk.Label(status_panel, textvariable=self.vram_label_var, bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 10)).grid(
             row=0, column=5, sticky="w"
         )
-        self.vram_bar = tk.Canvas(status_panel, height=12, bg=self.colors["field"], highlightthickness=1, highlightbackground=self.colors["border"])
-        self.vram_bar.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(10, 0))
+        self.vram_confidence_var = tk.StringVar(value="")
+        self.vram_confidence_label = tk.Label(
+            status_panel, textvariable=self.vram_confidence_var, bg=self.colors["panel"], font=("TkDefaultFont", 12)
+        )
+        self.vram_confidence_label.grid(row=0, column=6, sticky="w", padx=(4, 0))
+        self.vram_bar = tk.Canvas(status_panel, height=36, bg=self.colors["field"], highlightthickness=1, highlightbackground=self.colors["border"])
+        self.vram_bar.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(10, 0))
         self.vram_bar.bind("<Configure>", lambda _event: self.draw_vram_bar())
         self.vram_breakdown_var = tk.StringVar()
         tk.Label(
@@ -1240,7 +1296,13 @@ class LauncherApp:
             row=0, column=0, sticky="w", padx=(0, 12), pady=(0, 10)
         )
         flag_var = tk.StringVar()
-        flag_entry = self.make_entry(shell, flag_var)
+        flag_entry = ttk.Combobox(
+            shell,
+            textvariable=flag_var,
+            values=KNOWN_LLAMA_FLAGS,
+            style="Dark.TCombobox",
+            height=20,
+        )
         flag_entry.grid(row=0, column=1, sticky="ew", pady=(0, 10), ipady=6)
 
         tk.Label(shell, text="Value", bg=self.colors["bg"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
@@ -1483,6 +1545,7 @@ class LauncherApp:
             return
         name = self.selected_preset
         preset = {
+            "format_version": 1,
             "preset_name": name.strip(),
             "inferer": self.current_inferer_key(),
             "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
@@ -1513,6 +1576,7 @@ class LauncherApp:
         if not name:
             return
         preset = {
+            "format_version": 1,
             "preset_name": name.strip(),
             "inferer": self.current_inferer_key(),
             "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
@@ -2118,14 +2182,15 @@ class LauncherApp:
             return f"{raw} -> full offload ({min(ngl, total_layers)}/{total_layers} layers)"
         return f"{min(ngl, total_layers)}/{total_layers} layers"
 
-    def estimate_confidence(self) -> str:
+    def estimate_confidence(self) -> tuple[str, str]:
+        """Returns (label, color) where color is a hex color for the badge dot."""
         if not self.model_meta:
-            return "no model selected"
+            return ("no model selected", self.colors["conf_red"])
         if self.model_meta.n_layers and self.model_meta.n_embd_k_gqa and self.model_meta.n_embd_v_gqa:
-            return "full metadata"
+            return ("full metadata", self.colors["conf_green"])
         if self.model_meta.n_layers and self.model_meta.n_embd and self.model_meta.n_kv_heads:
-            return "partial metadata"
-        return "file-size only"
+            return ("partial metadata", self.colors["conf_yellow"])
+        return ("file-size only", self.colors["conf_red"])
 
     def recalculate_vram(self) -> None:
         meta = self.model_meta
@@ -2237,6 +2302,10 @@ class LauncherApp:
             bits.append(f"of {human_bytes(total)}")
         bits.append(f"({self.vram_source})")
         self.vram_label_var.set(" ".join(bits))
+        # Confidence badge
+        conf_label, conf_color = self.estimate_confidence()
+        self.vram_confidence_var.set("\u25cf")
+        self.vram_confidence_label.configure(fg=conf_color)
         self.update_vram_breakdown()
 
     def _configure_flag_columns(self, n: int) -> None:
@@ -2304,21 +2373,27 @@ class LauncherApp:
         if not total:
             return
         segments = [
-            ("weights", "#58a6ff"),
-            ("kv", "#f2cc60"),
-            ("mtp_kv", "#f778ba"),
-            ("draft", "#a371f7"),
-            ("mmproj", "#3fb950"),
-            ("overhead", "#ff7b72"),
+            ("weights", "#5b8ec9", "MODEL", "#ffffff"),
+            ("kv", "#c9a04e", "KV", "#0a0d14"),
+            ("mtp_kv", "#c4608a", "MTP", "#ffffff"),
+            ("draft", "#8a6cc7", "DRAFT", "#ffffff"),
+            ("mmproj", "#5a9060", "MMPROJ", "#ffffff"),
+            ("overhead", "#c95a4e", "OVERHEAD", "#ffffff"),
         ]
         x = 0.0
-        for key, color in segments:
+        label_y = height // 2
+        for key, color, short, text_color in segments:
             size = max(0.0, float(self.estimate.get(key, 0.0)))
             segment_width = (size / total) * width
             if segment_width <= 0:
                 continue
             x2 = min(width, x + segment_width)
             canvas.create_rectangle(x, 0, x2, height, fill=color, outline="")
+            # Inside label — short name + compact GiB value if wide enough
+            if segment_width > 80:
+                compact = f"{human_bytes(size)}".replace(" ", "")
+                label = f"{short} {compact}"
+                canvas.create_text(x + 6, label_y, text=label, fill=text_color, font=("DejaVu Sans Mono", 10, "bold"), anchor="w")
             x = x2
         # Total GPU usage marker (dimmer line)
         if self.vram_total_used is not None and total:
@@ -2335,7 +2410,7 @@ class LauncherApp:
             return
         total_layers = int(self.estimate.get("total_layers", 0))
         ngl = int(self.estimate.get("ngl", 0))
-        confidence = self.estimate_confidence()
+        conf_label, conf_color = self.estimate_confidence()
         layer_text = self.describe_gpu_layers_for_estimate(total_layers, ngl) if total_layers else "no model layers available"
         mtp_kv_bytes = self.estimate.get("mtp_kv", 0.0)
         parts = [
@@ -2349,14 +2424,14 @@ class LauncherApp:
             f"MMProj {human_bytes(self.estimate.get('mmproj', 0.0))}",
             f"Overhead {human_bytes(self.estimate.get('overhead', 0.0))}",
         ])
-        legend = "Model blue + Context yellow + MTP KV pink + Draft purple + MMProj green + Overhead red\n"
+        legend = "Model blue + Context gold + MTP rose + Draft violet + MMProj green + Overhead coral\n"
         meta = self.model_meta
         sw_text = f" | SWA: {meta.sliding_window} (KV est. uses SWA window)" if meta and meta.sliding_window else ""
         self.vram_breakdown_var.set(
             legend
             + " + ".join(parts)
             + f" = {human_bytes(self.estimate.get('estimated', 0.0))}\n"
-            + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {confidence}{sw_text}"
+            + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {conf_label}{sw_text}"
         )
 
     def build_command(self, validate_model: bool = True) -> list[str]:
@@ -2613,41 +2688,43 @@ class LauncherApp:
                 self.set_status("Running")
 
     def capture_tokens_per_second(self, text: str) -> None:
-        # Prompt eval time → TTFT (Time To First Token)
-        ttft_match = re.search(
-            r"prompt\s+eval\s+(?:took|time\s*=\s*)\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*/\s*(\d+)\s*tokens",
-            text,
-            re.IGNORECASE,
-        )
-        if ttft_match:
-            ms = float(ttft_match.group(1))
-            self._session_ttft_ms.append(ms)
-
-        # Generation eval time → average tok/s accumulator
-        # Match "eval" (took|time =) but not when preceded by "prompt"
-        gen_match = re.search(
-            r"(?<!prompt\s)eval\s+(?:took|time\s*=\s*)\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*/\s*(\d+)\s*tokens",
-            text,
-            re.IGNORECASE,
-        )
-        if gen_match:
-            ms = float(gen_match.group(1))
-            tokens = int(gen_match.group(2))
-            self._session_gen_tokens += tokens
-            self._session_gen_time_ms += ms
-
-        # Legacy: keep last tok/s for display as well
-        match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/s|tok/s|t/s)", text, re.IGNORECASE)
-        if not match:
-            return
         try:
-            self.last_tokens_per_second = float(match.group(1))
-        except ValueError:
-            return
-        if self.tokps_var:
-            self.tokps_var.set(f"{self.last_tokens_per_second:.2f} tok/s")
+            # Prompt eval time → TTFT (Time To First Token)
+            ttft_match = re.search(
+                r"prompt\s+eval\s+(?:took|time\s*=\s*)\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*/\s*(\d+)\s*tokens",
+                text,
+                re.IGNORECASE,
+            )
+            if ttft_match:
+                ms = float(ttft_match.group(1))
+                self._session_ttft_ms.append(ms)
 
-        self._update_session_display()
+            # Generation eval time → average tok/s accumulator
+            # Match "eval" (took|time =) but not when preceded by "prompt"
+            gen_match = re.search(
+                r"(?<!prompt\s)eval\s+(?:took|time\s*=\s*)\s*([0-9]+(?:\.[0-9]+)?)\s*ms\s*/\s*(\d+)\s*tokens",
+                text,
+                re.IGNORECASE,
+            )
+            if gen_match:
+                ms = float(gen_match.group(1))
+                tokens = int(gen_match.group(2))
+                self._session_gen_tokens += tokens
+                self._session_gen_time_ms += ms
+
+            # Legacy: keep last tok/s for display as well
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:tokens/s|tok/s|t/s)", text, re.IGNORECASE)
+            if match:
+                try:
+                    self.last_tokens_per_second = float(match.group(1))
+                except ValueError:
+                    pass
+                if self.tokps_var:
+                    self.tokps_var.set(f"{self.last_tokens_per_second:.2f} tok/s")
+
+            self._update_session_display()
+        except Exception:
+            pass  # future llama-server log format change — stats just stop updating, don't crash
 
     def drain_log_queue(self) -> None:
         while True:
