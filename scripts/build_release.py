@@ -86,6 +86,10 @@ def main() -> int:
     if readme.exists():
         shutil.copy2(readme, output_dir / "README.md")
 
+    cli_script = ROOT / "llamawrap-cli.py"
+    if cli_script.exists():
+        shutil.copy2(cli_script, output_dir / "llamawrap-cli.py")
+
     archive_path = archive(output_dir, args.tag)
     print(f"Built {archive_path}")
     return 0

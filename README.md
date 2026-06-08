@@ -74,7 +74,7 @@ Extract the archive for your platform and run:
 - **macOS:** open `llama-wrap.app` or run the packaged `llama-wrap` executable
 - **Linux:** `./llama-wrap`
 
-The CLI (`llamawrap-cli.py`) is not packaged into the binary — run it directly with Python from a source checkout.
+The CLI script (`llamawrap-cli.py`) is included in the archive — run it from the extracted folder: `python llamawrap-cli.py`.
 
 ## Session Stats
 
