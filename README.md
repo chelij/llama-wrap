@@ -1,165 +1,314 @@
 # llama-wrap
 
-`llama-wrap` is a lightweight launcher for `llama-server` — available as both a **desktop GUI** (Tkinter) and an **interactive CLI** (zero dependencies).
+`llama-wrap` is a lightweight launcher for `llama-server`-compatible GGUF model servers.
 
-It is not a chat UI. It is a tool for building, importing, saving, and running `llama-server`-compatible commands with GGUF models.
+It helps you build, import, save, and run launch commands without retyping long flag lists. Use the desktop GUI when you want a visual launcher, or the interactive CLI when you are working from a terminal or a headless machine.
+
+It is not a chat UI, model downloader, or model manager.
 
 ![llama-wrap screenshot](screenshot.png)
 
-## Features
+## Quick Start
 
-- **GUI & CLI** — use the desktop launcher or the terminal, whichever fits your workflow.
-- **Browse** for model, draft model, and MMProj `.gguf` files.
-- **Choose** the default `llama.cpp` inferer or a custom llama-server-compatible executable.
-- **Edit** common server flags without typing the full command — or add custom flag rows.
-- **2ⁿ step controls** for numeric flags.
-- **Import** an existing server command and parse recognized values into the UI.
-- **Presets** — save, reload, rename, and delete launch configurations.
-- **Session stats** — average TTFT (ms) and average tok/s are tracked across the session and saved to each preset. Accurate via the auto-enabled `--metrics` endpoint.
-- **Auto-restart** — optionally restart the server after a crash, with a visible restart counter.
-- **Live output** — view server logs in the GUI or piped to the terminal in the CLI.
-- **VRAM estimate** — model-aware breakdown of GPU memory usage.
-- **Interactive CLI browser** — select presets by number, edit flags with tab completion, and launch with a single keypress.
+### From Source
 
-## Requirements
+```bash
+git clone <repo-url>
+cd llama-launch-ui
+python llamawrap.py
+```
 
-- Python 3.10 or newer.
-- Tkinter (for the GUI mode; the CLI does not need it).
-- `llama-server` from `llama.cpp` or another compatible server executable.
-- At least one GGUF model file.
-- Optional smaller draft GGUF model for speculative decoding.
-- Optional MMProj GGUF file for multimodal/vision models.
+When started from a terminal, `llamawrap.py` opens the interactive CLI. When launched from a desktop/double-click context, it opens the GUI when Tk/display support is available.
 
-## Run
+Force a mode when needed:
 
-### GUI
+```bash
+python llamawrap.py --gui
+python llamawrap.py --cli
+python llamawrap.py --mode auto
+```
+
+### Release Build
+
+Download and extract the release archive for your platform.
+
+Linux:
+
+```bash
+./llama-wrap
+```
+
+Windows:
+
+```powershell
+.\llama-wrap.exe
+```
+
+macOS:
+
+```bash
+open llama-wrap.app
+```
+
+The release build follows the same idea: desktop launch opens the GUI, terminal launch opens the CLI where the platform/package supports terminal detection. The standalone `llamawrap-cli.py` script is also included in release archives.
+
+### Create Your First Preset
+
+Interactive CLI:
 
 ```bash
 python llamawrap.py
 ```
 
-### CLI (interactive browser)
+Then press `c` to create a preset, or `i` to import an existing `llama-server` command.
+
+Direct CLI:
 
 ```bash
-python llamawrap-cli.py
+python llamawrap.py create "My Model" /models/model.gguf --set -ngl all --set -c 32768
+python llamawrap.py run "My Model"
 ```
 
-The CLI opens an interactive browser — just select a preset by number, then choose an action:
+Import an existing command:
 
-```
-  s     show full details
-  f     edit flags
-  r     run (launch server)
-  a     run with auto-restart on crash
-  d     delete this preset
-  b     back to list
+```bash
+python llamawrap.py import "My Model" llama-server -m /models/model.gguf -ngl all -c 32768
+python llamawrap.py run "My Model"
 ```
 
-### CLI (direct commands)
+## Basic Workflow
+
+1. Choose a model `.gguf` file.
+2. Optionally choose an MMProj `.gguf` file for vision/multimodal models.
+3. Optionally choose a smaller draft `.gguf` model for speculative decoding.
+4. Adjust common launch flags such as GPU layers, context size, host, and port.
+5. Add custom flags or extra args when needed.
+6. Launch the server.
+7. Save the setup as a preset for reuse.
+
+## Features
+
+- **GUI and CLI**: use a desktop launcher or terminal browser from the same project.
+- **Presets**: save, load, rename, delete, create, and import launch configurations.
+- **Command import**: paste an existing `llama-server` command and turn it into a preset.
+- **Model selectors**: browse for model, MMProj, and draft `.gguf` files.
+- **Flag editing**: edit common flags, add custom flags, or pass advanced extra args.
+- **Auto-restart**: restart a server if it crashes.
+- **Live output**: view server logs in the GUI or terminal.
+- **Session stats**: track average TTFT, tok/s, and restart count per preset.
+- **VRAM estimate**: estimate memory use from model size, GGUF metadata, context, KV cache, GPU layers, draft model, and MMProj.
+
+## Common Tasks
+
+### Open GUI Explicitly
+
+```bash
+python llamawrap.py --gui
+```
+
+### Open CLI Explicitly
+
+```bash
+python llamawrap.py --cli
+```
+
+### List Presets
+
+```bash
+python llamawrap.py list
+```
+
+### Show Preset Details
+
+```bash
+python llamawrap.py show "My Model"
+```
+
+### Create a Preset
+
+```bash
+python llamawrap.py create "My Model" /models/model.gguf --set -ngl all --set -c 32768
+```
+
+### Import a Launch Command
+
+```bash
+python llamawrap.py import "My Model" llama-server -m /models/model.gguf -ngl all -c 32768 --port 8080
+```
+
+### Edit a Flag
+
+```bash
+python llamawrap.py set "My Model" --port 8080
+python llamawrap.py enable "My Model" --jinja
+python llamawrap.py disable "My Model" -ngl
+```
+
+### Run a Preset
+
+```bash
+python llamawrap.py run "My Model"
+python llamawrap.py run "My Model" --auto
+```
+
+## Interactive CLI
+
+Run:
+
+```bash
+python llamawrap.py --cli
+```
+
+Main menu:
+
+```text
+c     create a new preset
+i     import a pasted launch command
+r     reload presets
+q     quit
+```
+
+After selecting a preset:
+
+```text
+s     show full details
+f     edit flags
+r     run (launch server)
+a     run with auto-restart on crash
+d     delete this preset
+b     back to list
+```
+
+In the create flow, model, MMProj, and draft model fields use a numbered file selector that shows folders and `.gguf` files.
+
+Selector controls:
+
+```text
+number      open folder or select file
+0           parent folder
+p <path>    paste a path manually
+q           cancel
+blank       skip optional fields
+```
+
+The interactive flag editor supports Tab completion for commands and flag names:
+
+```text
+ena + Tab          enable
+enable --p + Tab   --port, --presence-penalty, ...
+set -n + Tab       -ngl, -np, ...
+```
+
+## CLI Reference
+
+You can use either `python llamawrap.py <command>` or `llamawrap-cli <command>`.
 
 ```bash
 llamawrap-cli list
-llamawrap-cli show "My Preset"
-llamawrap-cli run "My Preset" --auto
-llamawrap-cli set "My Preset" --port 8080
-llamawrap-cli enable "My Preset" --jinja
-llamawrap-cli disable "My Preset" -ngl
+llamawrap-cli create "My Model" /models/model.gguf --set -ngl all --set -c 32768
+llamawrap-cli import "My Model" llama-server -m /models/model.gguf -ngl all -c 32768
+llamawrap-cli show "My Model"
+llamawrap-cli run "My Model" --auto
+llamawrap-cli set "My Model" --port 8080
+llamawrap-cli enable "My Model" --jinja
+llamawrap-cli disable "My Model" -ngl
 llamawrap-cli rename "Old Name" "New Name"
+llamawrap-cli delete "My Model"
 llamawrap-cli help run
 ```
 
-### Release builds
+## Presets and Storage
 
-Extract the archive for your platform and run:
+Presets are stored in `history.json`.
 
-- **Windows:** `llama-wrap.exe`
-- **macOS:** open `llama-wrap.app` or run the packaged `llama-wrap` executable
-- **Linux:** `./llama-wrap`
-
-The CLI script (`llamawrap-cli.py`) is included in the archive — run it from the extracted folder: `python llamawrap-cli.py`.
-
-## Session Stats
-
-Every time you run a preset, `llama-wrap` tracks:
-
-- **Average TTFT** (Time To First Token) — accumulated from each request's prompt eval time.
-- **Average Tok/s** — weighted average across all generation steps.
-
-These are computed from the server's `/metrics` endpoint (auto-enabled) and saved to the preset on stop. The `Last:` line in the CLI or "Last session:" label in the GUI shows them at a glance.
-
-```
-Last:  53.1ms TTFT | 41.51 tok/s
-```
-
-With auto-restart, stats accumulate across all restarts and a restart counter is shown:
-
-```
-Last:  53.1ms TTFT | 41.51 tok/s | 3 restarts
-```
-
-## Basic Usage
-
-1. Choose a model `.gguf` file.
-2. Optionally choose a smaller draft `.gguf` model for speculative decoding.
-3. Optionally choose an MMProj `.gguf` file.
-4. Adjust the common flags shown in the UI.
-5. Add custom flags with the plus button beside `Flags`, or put advanced one-off arguments in `Extra args`.
-6. Press launch to start the selected inferer.
-7. Watch the output panel for logs.
-8. Save the setup as a preset if you want to reuse it.
-
-## Presets
-
-Presets are stored in `history.json` next to `llamawrap.py` when running from source, or next to the launcher binary in release builds.
+- From source: next to `llamawrap.py`
+- Release build: next to the launcher binary
 
 Each preset stores:
 
-- model path, MMProj path, draft model path
-- enabled flags and their values
+- model path, MMProj path, and draft model path
+- enabled flags and values
 - custom and hidden flag rows
 - extra args
 - selected inferer and executable
-- **session stats** from the last run (TTFT avg, tok/s avg, restart count)
+- session stats from the last run
 
-Recent run commands are also saved.
+Recent run commands are also saved, capped to the latest 100 entries.
 
-The CLI's `list` and `show` commands display everything in a compact format.
+## Importing Existing Commands
 
-## CLI Tab Completion
-
-In the CLI's interactive flag editor (`f`), tab completion is available:
-
-- `ena` + Tab → `enable`
-- `enable --p` + Tab → `--port`, `--presence-penalty`, etc.
-- `set -n` + Tab → `-ngl`, `-np`, etc.
-- Works for `enable`, `disable`, `rmflag`, and `set`.
-
-## Importing Commands
-
-Use the import button (GUI) to paste an existing server command:
+Use the GUI import button or CLI import command to paste an existing launch command:
 
 ```bash
 llama-server -m /models/model.gguf -ngl all -c 32768 --host 127.0.0.1 --port 8080
 ```
 
-Recognized flags are loaded into the UI. Unrecognized flags stay in `Extra args`. Custom flags are added as editable rows.
+Recognized flags are loaded into preset fields. Unknown flags are preserved as custom flags or extra args so the command is not silently lost.
 
-## Inferers
+## Session Stats
 
-- `llama.cpp` uses the standard `llama-server` executable.
-- `Custom` is for other llama-server-compatible executables. Selecting it auto-focuses the executable field.
+Every time you run a preset, `llama-wrap` tracks:
+
+- **Average TTFT**: Time To First Token, from prompt evaluation timing.
+- **Average tok/s**: weighted generation throughput.
+- **Auto-restarts**: restart count when `--auto` is used.
+
+Stats are computed from the server `/metrics` endpoint when available. `--metrics` is automatically added to launches so stats can be collected.
+
+Example:
+
+```text
+Last:  53.1ms TTFT | 41.51 tok/s
+Last:  53.1ms TTFT | 41.51 tok/s | 3 restarts
+```
+
+The metrics endpoint is available at:
+
+```text
+http://127.0.0.1:<port>/metrics
+```
 
 ## VRAM Estimate
 
-The VRAM display is an estimate based on model file size, parsed GGUF metadata, context size (`-c`), KV cache type, GPU layers, draft model size, MMProj size, and runtime overhead. Shown in binary units (MiB, GiB).
+The VRAM display is an estimate. It uses:
 
-## Notes
+- model file size
+- parsed GGUF metadata
+- context size (`-c`)
+- KV cache type
+- GPU layers
+- draft model size
+- MMProj size
+- runtime overhead
 
-- This app does not download models.
-- This app does not manage chat conversations.
-- This app does not replace Open WebUI, LM Studio, or the built-in llama.cpp Web UI.
-- It is a small local process wrapper for people who already use llama-server-compatible inferers.
-- `--metrics` is automatically added to every launch for accurate session stats. The `/metrics` endpoint is available at `http://127.0.0.1:<port>/metrics`.
+Values are shown in binary units such as MiB and GiB.
+
+## Requirements
+
+- Python 3.10 or newer
+- Tkinter for GUI mode
+- `llama-server` from `llama.cpp`, or another compatible executable
+- at least one GGUF model file
+- optional MMProj GGUF file for multimodal/vision models
+- optional smaller draft GGUF file for speculative decoding
+
+The CLI does not require Tkinter.
+
+## Inferers
+
+- `llama.cpp`: uses the standard `llama-server` executable.
+- `Custom`: for other llama-server-compatible executables.
+
+## Limits
+
+`llama-wrap` does not:
+
+- download models
+- manage chat conversations
+- replace Open WebUI, LM Studio, or the built-in llama.cpp Web UI
+- provide a hosted server
+
+It is a small local process wrapper for people who already use `llama-server`-compatible inferers.
 
 ## Support
 

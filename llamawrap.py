@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import runpy
 import shlex
 import shutil
 import signal
@@ -12,12 +13,24 @@ import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
 from typing import Any
+import urllib.request as urllib_req
+import webbrowser
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog, ttk
+    TK_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    tk = None
+    messagebox = None
+    simpledialog = None
+    ttk = None
+    TK_IMPORT_ERROR = exc
+TK_TCL_ERROR = tk.TclError if tk is not None else RuntimeError
 
 
 APP_TITLE = "llama-wrap"
@@ -558,6 +571,8 @@ class LauncherApp:
         self._session_stats_var: tk.StringVar | None = None
         self._auto_restart_count: int = 0
         self.loading_preset = False
+        self._server_ready: bool = False
+        self._health_check_timer: str | None = None
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
@@ -959,7 +974,7 @@ class LauncherApp:
         controls.columnconfigure(1, weight=1)
         button_bar = tk.Frame(controls, bg=self.colors["bg"])
         button_bar.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        for col in range(5):
+        for col in range(6):
             button_bar.columnconfigure(col, weight=1, uniform="control_buttons")
         launch_button = self.make_button(button_bar, "Launch", self.launch, width=72, bg=self.colors["good"], hover=self.colors["good_hover"])
         launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -996,6 +1011,11 @@ class LauncherApp:
         copy_button = self.make_button(button_bar, "Copy", self.copy_command, width=72, bg=self.colors["panel_soft"])
         copy_button.grid(row=0, column=4, sticky="ew")
         Tooltip(copy_button, "Copy command\n\nCopy the full launch command to the clipboard.")
+
+        # Open UI button — opens the browser to the server's web UI
+        self.open_ui_button = self.make_button(button_bar, "Open UI", self.open_browser_ui, width=72, bg=self.colors["import"], hover=self.colors["import_hover"])
+        self.open_ui_button.grid(row=0, column=5, sticky="ew", padx=(6, 0))
+        Tooltip(self.open_ui_button, "Open UI\n\nOpen the llama.cpp web UI or API docs in your browser.\nOnly works when the server is running.")
         self.command_var = tk.StringVar()
         self.command_label = tk.Label(
             controls,
@@ -2502,6 +2522,7 @@ class LauncherApp:
 
     def start_process(self, command: list[str], add_separator: bool = False) -> None:
         self.model_loaded = False
+        self._server_ready = False
         self.reset_session_stats()
         self.kill_existing_on_port(self.get_int_flag("--port", DEFAULT_SERVER_PORT))
         if add_separator:
@@ -2550,6 +2571,7 @@ class LauncherApp:
 
     def stop_process(self) -> None:
         self.intentional_stop = True
+        self._stop_health_check()
         if self.process and self.process.poll() is None:
             self.append_log("warn", "Stopping inferer...")
             try:
@@ -2559,12 +2581,15 @@ class LauncherApp:
                     self.process.terminate()
             except Exception:
                 self.process.terminate()
+        self._server_ready = False
         self.set_status("Stopped")
         self._save_session_stats_to_preset()
 
     def refresh_process_state(self) -> None:
-        if self.process and self.process.poll() is not None and self.status_var.get() in {"Launching", "Running"}:
+        if self.process and self.process.poll() is not None and self.status_var.get() in {"Launching", "Running", "Ready"}:
             code = self.process.returncode
+            self._stop_health_check()
+            self._server_ready = False
             if code == 0 or self.intentional_stop:
                 self.set_status("Stopped")
             else:
@@ -2591,16 +2616,67 @@ class LauncherApp:
         self.root.after(interval, self.refresh_gpu_usage)
 
     def set_status(self, status: str) -> None:
-        self.status_var.set(status)
+        if status == "Running" and self._server_ready:
+            display = "Ready"
+        elif status == "Running":
+            display = "Running"
+        else:
+            display = status
+        self.status_var.set(display)
         if hasattr(self, "status_label"):
             colors = {
                 "Stopped": self.colors["panel_soft"],
                 "Launching": self.colors["warn"],
-                "Running": self.colors["good"],
+                "Running": self.colors["accent"],
+                "Ready": self.colors["good"],
                 "Error": self.colors["danger"],
                 "Crashed": self.colors["danger"],
             }
-            self.status_label.configure(bg=colors.get(status, self.colors["panel_soft"]))
+            self.status_label.configure(bg=colors.get(display, self.colors["panel_soft"]))
+
+    def _get_server_url(self) -> str:
+        """Build the server URL from host and port flags."""
+        host = self.flags.get("--host", FlagConfig("", "127.0.0.1", False)).value.strip() or "127.0.0.1"
+        port = self.get_int_flag("--port", DEFAULT_SERVER_PORT)
+        return f"http://{host}:{port}"
+
+    def open_browser_ui(self) -> None:
+        """Open the llama.cpp web UI in the default browser."""
+        url = self._get_server_url()
+        webbrowser.open(url)
+        self.append_log("normal", f"Opening browser at {url}")
+
+    def _start_health_check(self) -> None:
+        """Start polling the /health endpoint to detect when the server is ready."""
+        self._server_ready = False
+        self._health_check_tick()
+
+    def _stop_health_check(self) -> None:
+        """Cancel any pending health check timer."""
+        if self._health_check_timer:
+            self.root.after_cancel(self._health_check_timer)
+            self._health_check_timer = None
+
+    def _health_check_tick(self) -> None:
+        """Poll /health once. On success, mark server as ready. On failure, retry."""
+        if not self.process or self.process.poll() is not None:
+            self._server_ready = False
+            self.set_status("Stopped")
+            self._health_check_timer = None
+            return
+        url = self._get_server_url() + "/health"
+        try:
+            resp = urllib_req.urlopen(url, timeout=2)
+            resp.read()
+        except Exception:
+            # Server not ready yet — poll again in 500ms
+            self._health_check_timer = self.root.after(500, self._health_check_tick)
+            return
+        # Health check passed
+        self._server_ready = True
+        self._health_check_timer = None
+        self.set_status("Ready")
+        self.append_log("normal", f"Server ready at {self._get_server_url()}")
 
     def classify_log(self, line: str) -> str:
         lower = line.lower()
@@ -2686,6 +2762,8 @@ class LauncherApp:
             self.model_loaded = True
             if self.process and self.process.poll() is None:
                 self.set_status("Running")
+                # Kick off health check polling
+                self._start_health_check()
 
     def capture_tokens_per_second(self, text: str) -> None:
         try:
@@ -2766,9 +2844,85 @@ class LauncherApp:
         self.root.after(200, self._check_sigint)
 
 
-if __name__ == "__main__":
+CLI_COMMANDS = {
+    "list", "create", "import", "show", "set", "enable", "disable",
+    "rmflag", "rename", "delete", "run", "help",
+}
+
+
+def parse_launch_mode(argv: list[str]) -> tuple[str, list[str]]:
+    if not argv:
+        return "auto", []
+    if argv[0] == "--gui":
+        return "gui", argv[1:]
+    if argv[0] == "--cli":
+        return "cli", argv[1:]
+    if argv[0] == "--mode":
+        if len(argv) < 2 or argv[1] not in {"auto", "gui", "cli"}:
+            print("usage: llamawrap.py [--gui | --cli | --mode auto|gui|cli] [cli args...]", file=sys.stderr)
+            raise SystemExit(1)
+        return argv[1], argv[2:]
+    return "auto", argv
+
+
+def run_cli(argv: list[str]) -> None:
+    cli_path = APP_DIR / "llamawrap-cli.py"
+    if not cli_path.exists():
+        cli_path = Path(__file__).resolve().with_name("llamawrap-cli.py")
+    if not cli_path.exists():
+        print("error: llamawrap-cli.py not found next to launcher", file=sys.stderr)
+        raise SystemExit(1)
+
+    old_argv = sys.argv[:]
     try:
-        LauncherApp().run()
-    except tk.TclError as exc:
-        print(f"{APP_TITLE} could not start: {exc}", file=sys.stderr)
-        raise
+        sys.argv = [str(cli_path), *argv]
+        runpy.run_path(str(cli_path), run_name="__main__")
+    finally:
+        sys.argv = old_argv
+
+
+def run_gui() -> None:
+    if tk is None:
+        print(f"{APP_TITLE} GUI is unavailable: {TK_IMPORT_ERROR}", file=sys.stderr)
+        raise SystemExit(1)
+    LauncherApp().run()
+
+
+def launched_from_terminal() -> bool:
+    return bool(getattr(sys.stdin, "isatty", lambda: False)() and getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def main(argv: list[str] | None = None) -> None:
+    mode, remaining = parse_launch_mode(list(sys.argv[1:] if argv is None else argv))
+
+    if mode == "cli":
+        run_cli(remaining)
+        return
+    if mode == "gui":
+        if remaining:
+            print("error: --gui does not accept CLI command arguments", file=sys.stderr)
+            raise SystemExit(1)
+        run_gui()
+        return
+
+    if remaining and (remaining[0] in CLI_COMMANDS or remaining[0] in {"-h", "--help"}):
+        run_cli(remaining)
+        return
+
+    if not remaining and launched_from_terminal():
+        run_cli([])
+        return
+
+    try:
+        run_gui()
+    except SystemExit:
+        if tk is not None:
+            raise
+        run_cli(remaining)
+    except TK_TCL_ERROR as exc:
+        print(f"{APP_TITLE} GUI is unavailable, falling back to CLI: {exc}", file=sys.stderr)
+        run_cli(remaining)
+
+
+if __name__ == "__main__":
+    main()

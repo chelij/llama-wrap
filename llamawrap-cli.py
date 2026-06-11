@@ -4,6 +4,8 @@ Interactive preset browser and CLI for llama-wrap history.json.
 
 Usage:
     llamawrap-cli              Interactive preset browser (default)
+    llamawrap-cli create <name> <model-path> [options]
+    llamawrap-cli import <name> <command-or-args>
     llamawrap-cli list
     llamawrap-cli show <name>
     llamawrap-cli set <name> <flag> <value>
@@ -59,7 +61,19 @@ def load_history(path: Path) -> dict:
         sys.exit(1)
 
 
+def load_or_init_history(path: Path) -> dict:
+    if path.exists():
+        return load_history(path)
+    return {
+        "format_version": 1,
+        "presets": [],
+        "runs": [],
+        "settings": {},
+    }
+
+
 def save_history(path: Path, data: dict) -> None:
+    data["format_version"] = data.get("format_version", 1)
     data["presets"] = data.get("presets", [])
     data["runs"] = (data.get("runs") or [])[-100:]
     data["settings"] = data.get("settings", {})
@@ -78,9 +92,544 @@ def error(msg: str) -> None:
     sys.exit(1)
 
 
+ALIAS_TO_FLAG = {
+    "--model": "-m",
+    "-m": "-m",
+    "--gpu-layers": "-ngl",
+    "--n-gpu-layers": "-ngl",
+    "-ngl": "-ngl",
+    "--ctx-size": "-c",
+    "-c": "-c",
+    "--threads": "-t",
+    "-t": "-t",
+    "--threads-batch": "-tb",
+    "-tb": "-tb",
+    "--flash-attn": "-fa",
+    "-fa": "-fa",
+    "--cache-type-k": "-ctk",
+    "-ctk": "-ctk",
+    "--cache-type-v": "-ctv",
+    "-ctv": "-ctv",
+    "--port": "--port",
+    "--host": "--host",
+    "--batch-size": "-b",
+    "-b": "-b",
+    "--ubatch-size": "-ub",
+    "-ub": "-ub",
+    "--parallel": "-np",
+    "-np": "-np",
+    "--alias": "-a",
+    "-a": "-a",
+    "--timeout": "-to",
+    "-to": "-to",
+    "--mmproj": "--mmproj",
+    "-mm": "--mmproj",
+    "--spec-draft-model": "-md",
+    "--model-draft": "-md",
+    "-md": "-md",
+    "--spec-type": "--spec-type",
+    "--spec-draft-n-max": "--spec-draft-n-max",
+    "--draft-max": "--spec-draft-n-max",
+    "--draft": "--spec-draft-n-max",
+    "--spec-draft-n-min": "--spec-draft-n-min",
+    "--draft-min": "--spec-draft-n-min",
+    "--spec-draft-p-min": "--spec-draft-p-min",
+    "--draft-p-min": "--spec-draft-p-min",
+    "--spec-draft-ngl": "-ngld",
+    "--gpu-layers-draft": "-ngld",
+    "--n-gpu-layers-draft": "-ngld",
+    "-ngld": "-ngld",
+    "--jinja": "--jinja",
+    "--fit": "--fit",
+    "--fit-margin": "--fit-margin",
+    "-mla": "-mla",
+    "--mla-use": "-mla",
+    "-fmoe": "-fmoe",
+    "--fused-moe": "-fmoe",
+    "-cram": "-cram",
+    "--cache-ram": "-cram",
+    "-khad": "-khad",
+    "--k-cache-hadamard": "-khad",
+    "-vhad": "-vhad",
+    "--v-cache-hadamard": "-vhad",
+    "-ncmoe": "-ncmoe",
+    "--n-cpu-moe": "-ncmoe",
+    "--cpu-moe": "-ncmoe",
+    "--reasoning": "--reasoning",
+    "-rea": "--reasoning",
+}
+
+
 # ───────────────────────────────────────
 #  Commands
 # ───────────────────────────────────────
+
+def default_cli_flags() -> dict:
+    return {
+        "-ngl": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--fit": {"value": "on", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--fit-margin": {"value": "1024", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-cram": {"value": "8192", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-ncmoe": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-c": {"value": "4096", "enabled": False, "value_required": True, "custom": False, "step_mode": "context"},
+        "-ctk": {"value": "f16", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-ctv": {"value": "f16", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-khad": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
+        "-vhad": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
+        "-t": {"value": "-1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-tb": {"value": "-1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-fa": {"value": "auto", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-mla": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-fmoe": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
+        "--port": {"value": "8080", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--host": {"value": "127.0.0.1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-np": {"value": "1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-a": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-to": {"value": "600", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-b": {"value": "2048", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-ub": {"value": "512", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--spec-type": {"value": "none", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--spec-draft-n-max": {"value": "16", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--spec-draft-n-min": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--spec-draft-p-min": {"value": "0.75", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-ngld": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--reasoning": {"value": "auto", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "--jinja": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
+        "--mmproj": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+    }
+
+
+def parse_create_args(args: list[str]) -> dict:
+    if len(args) < 3:
+        error("usage: llamawrap-cli create <preset-name> <model-path> [options]")
+
+    options = {
+        "name": args[1],
+        "model_path": args[2],
+        "inferer": "llama.cpp",
+        "executable": "llama-server",
+        "mmproj_path": "",
+        "draft_model_path": "",
+        "extra_args": "",
+        "sets": [],
+        "toggles": [],
+        "force": False,
+    }
+    i = 3
+    while i < len(args):
+        arg = args[i]
+        if arg == "--force":
+            options["force"] = True
+            i += 1
+        elif arg in ("--inferer", "--executable", "--mmproj", "--draft-model", "--extra-args"):
+            if i + 1 >= len(args):
+                error(f"usage: {arg} requires a value")
+            key = {
+                "--inferer": "inferer",
+                "--executable": "executable",
+                "--mmproj": "mmproj_path",
+                "--draft-model": "draft_model_path",
+                "--extra-args": "extra_args",
+            }[arg]
+            options[key] = args[i + 1]
+            i += 2
+        elif arg == "--set":
+            if i + 2 >= len(args):
+                error("usage: --set requires <flag> <value>")
+            options["sets"].append((args[i + 1], args[i + 2]))
+            i += 3
+        elif arg == "--toggle":
+            if i + 1 >= len(args):
+                error("usage: --toggle requires <flag>")
+            options["toggles"].append(args[i + 1])
+            i += 2
+        else:
+            error(f"unknown create option: {arg}")
+    return options
+
+
+def cmd_create(data: dict, path: Path, args: list[str]) -> None:
+    options = parse_create_args(args)
+    name = options["name"].strip()
+    model_path = options["model_path"].strip()
+    if not name:
+        error("preset name cannot be empty")
+    if not model_path:
+        error("model path cannot be empty")
+    if find_preset(data, name) and not options["force"]:
+        error(f"preset '{name}' already exists (use --force to replace it)")
+
+    flags = default_cli_flags()
+    mmproj_path = options["mmproj_path"].strip()
+    if mmproj_path:
+        flags["--mmproj"]["value"] = mmproj_path
+        flags["--mmproj"]["enabled"] = True
+
+    for flag, value in options["sets"]:
+        flags[flag] = {
+            "value": value,
+            "enabled": True,
+            "value_required": True,
+            "custom": flag not in flags,
+            "step_mode": flags.get(flag, {}).get("step_mode", ""),
+        }
+    for flag in options["toggles"]:
+        flags[flag] = {
+            "value": flags.get(flag, {}).get("value", ""),
+            "enabled": True,
+            "value_required": False,
+            "custom": flag not in flags,
+            "step_mode": flags.get(flag, {}).get("step_mode", ""),
+        }
+
+    preset = {
+        "format_version": 1,
+        "preset_name": name,
+        "inferer": options["inferer"].strip() or "llama.cpp",
+        "inferer_executable": options["executable"].strip() or "llama-server",
+        "model_path": model_path,
+        "mmproj_path": mmproj_path,
+        "draft_model_path": options["draft_model_path"].strip(),
+        "extra_args": options["extra_args"].strip(),
+        "hidden_flags": [],
+        "flags": flags,
+    }
+    presets = [p for p in data.get("presets", []) if p.get("preset_name") != name]
+    presets.append(preset)
+    data["presets"] = sorted(presets, key=lambda p: p.get("preset_name", "").lower())
+    save_history(path, data)
+    print(f"  created preset '{name}'")
+
+
+def consume_import_value(tokens: list[str], idx: int, inline_value: str | None, flag: str) -> tuple[str, int]:
+    if inline_value is not None:
+        return inline_value, idx
+    if idx + 1 >= len(tokens):
+        raise ValueError(f"{flag} needs a value.")
+    return tokens[idx + 1], idx + 1
+
+
+def preset_from_command(name: str, command_text: str) -> tuple[dict, int, list[str]]:
+    if not command_text.strip():
+        raise ValueError("Paste a server command first.")
+    try:
+        tokens = shlex.split(command_text)
+    except ValueError as exc:
+        raise ValueError(f"Could not read the command: {exc}") from exc
+    if not tokens:
+        raise ValueError("Paste a server command first.")
+
+    executable = "llama-server"
+    if tokens[0] and not tokens[0].startswith("-"):
+        executable = tokens[0]
+        tokens = tokens[1:]
+
+    flags = default_cli_flags()
+    valueless_flags = {flag for flag, cfg in flags.items() if not cfg.get("value_required", True)}
+    model_path = ""
+    mmproj_path = ""
+    draft_model_path = ""
+    extra_tokens: list[str] = []
+    skipped: list[str] = []
+    changed = 0
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token.startswith("--") and "=" in token:
+            token, inline_value = token.split("=", 1)
+        else:
+            inline_value = None
+
+        if token in {"-m", "--model"}:
+            model_path, idx = consume_import_value(tokens, idx, inline_value, token)
+            changed += 1
+        elif token in ALIAS_TO_FLAG:
+            flag = ALIAS_TO_FLAG[token]
+            if flag in valueless_flags:
+                value = inline_value or ""
+            else:
+                value, idx = consume_import_value(tokens, idx, inline_value, token)
+            if flag == "--mmproj":
+                mmproj_path = value
+                flags["--mmproj"]["value"] = value
+                flags["--mmproj"]["enabled"] = bool(value)
+            elif flag == "-md":
+                draft_model_path = value
+            elif flag in flags:
+                flags[flag]["value"] = value
+                flags[flag]["enabled"] = True
+            else:
+                skipped.append(token)
+                extra_tokens.extend([token, value])
+            changed += 1
+        elif token.startswith("-"):
+            value = inline_value or ""
+            value_required = inline_value is not None
+            if inline_value is None and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+                idx += 1
+                value = tokens[idx]
+                value_required = True
+            flags[token] = {
+                "value": value,
+                "enabled": True,
+                "value_required": value_required,
+                "custom": True,
+                "step_mode": "",
+            }
+            changed += 1
+        else:
+            extra_tokens.append(token)
+        idx += 1
+
+    preset = {
+        "format_version": 1,
+        "preset_name": name.strip(),
+        "inferer": "llama.cpp" if Path(executable).name == "llama-server" else "Custom",
+        "inferer_executable": executable,
+        "model_path": model_path,
+        "mmproj_path": mmproj_path,
+        "draft_model_path": draft_model_path,
+        "extra_args": shlex.join(extra_tokens) if extra_tokens else "",
+        "hidden_flags": [],
+        "flags": flags,
+    }
+    return preset, changed, skipped
+
+
+def cmd_import(data: dict, path: Path, name: str, command_text: str, *, force: bool = False) -> None:
+    name = name.strip()
+    if not name:
+        error("preset name cannot be empty")
+    if find_preset(data, name) and not force:
+        error(f"preset '{name}' already exists (use --force to replace it)")
+    try:
+        preset, changed, skipped = preset_from_command(name, command_text)
+    except ValueError as exc:
+        error(str(exc))
+    presets = [p for p in data.get("presets", []) if p.get("preset_name") != name]
+    presets.append(preset)
+    data["presets"] = sorted(presets, key=lambda p: p.get("preset_name", "").lower())
+    save_history(path, data)
+    summary = f"  imported preset '{name}' ({changed} setting{'s' if changed != 1 else ''})"
+    if skipped:
+        summary += f"; skipped: {', '.join(skipped[:8])}"
+        if len(skipped) > 8:
+            summary += f", +{len(skipped) - 8} more"
+    print(summary)
+
+
+def _path_matches(text: str, *, files_only: bool = False, suffixes: tuple[str, ...] = ()) -> list[str]:
+    expanded = os.path.expanduser(text)
+    if not expanded:
+        expanded = "."
+    directory, prefix = os.path.split(expanded)
+    if not directory:
+        directory = "."
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return []
+
+    matches = []
+    for entry in entries:
+        if not entry.startswith(prefix):
+            continue
+        full = os.path.join(directory, entry)
+        if os.path.isdir(full):
+            candidate = os.path.join(directory, entry) + os.sep
+        else:
+            if files_only and suffixes and not entry.lower().endswith(suffixes):
+                continue
+            candidate = os.path.join(directory, entry)
+        if text.startswith("~"):
+            home = os.path.expanduser("~")
+            if candidate == home:
+                candidate = "~"
+            elif candidate.startswith(home + os.sep):
+                candidate = "~" + candidate[len(home):]
+        elif not os.path.isabs(text) and candidate.startswith("." + os.sep):
+            candidate = candidate[2:]
+        matches.append(candidate)
+    return sorted(matches)
+
+
+def input_path(prompt: str, *, optional: bool = False, suffixes: tuple[str, ...] = ()) -> str:
+    old_completer = readline.get_completer()
+    old_delims = readline.get_completer_delims()
+
+    def completer(text: str, state: int) -> str | None:
+        matches = _path_matches(text, files_only=bool(suffixes), suffixes=suffixes)
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(completer)
+    readline.set_completer_delims(" \t\n")
+    readline.parse_and_bind("tab: complete")
+    try:
+        return input(prompt).strip()
+    finally:
+        readline.set_completer(old_completer)
+        readline.set_completer_delims(old_delims)
+
+
+def select_path(
+    title: str,
+    *,
+    start_dir: str = ".",
+    optional: bool = False,
+    suffixes: tuple[str, ...] = (),
+) -> str:
+    current = Path(os.path.expanduser(start_dir)).resolve()
+    while True:
+        print(f"\n── {title} ──")
+        print(f"  {current}")
+        print("  0. ..")
+        try:
+            entries = sorted(current.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except OSError as e:
+            print(f"  cannot read directory: {e}")
+            current = current.parent
+            continue
+
+        visible: list[Path] = []
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir() or not suffixes or entry.name.lower().endswith(suffixes):
+                visible.append(entry)
+
+        for idx, entry in enumerate(visible, 1):
+            marker = "/" if entry.is_dir() else ""
+            print(f"  {idx:>2}. {entry.name}{marker}")
+
+        commands = "number to open/select, p <path> to paste path, q to cancel"
+        if optional:
+            commands += ", blank to skip"
+        print(f"\n{commands}")
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return ""
+
+        if optional and not choice:
+            return ""
+        if choice.lower() == "q":
+            return ""
+        if choice == "0":
+            current = current.parent
+            continue
+        if choice.startswith("p "):
+            pasted = choice[2:].strip()
+            if pasted:
+                return pasted
+            continue
+        try:
+            idx = int(choice) - 1
+        except ValueError:
+            print("  enter a number, p <path>, or q")
+            continue
+        if idx < 0 or idx >= len(visible):
+            print("  invalid number")
+            continue
+
+        selected = visible[idx]
+        if selected.is_dir():
+            current = selected
+            continue
+        return str(selected)
+
+
+def prompt_create_preset(data: dict, history_path: Path) -> dict | None:
+    print("\n── Create preset ──")
+    try:
+        name = input("Preset name: ").strip()
+        if not name:
+            print("  cancelled")
+            return None
+        model_path = select_path("Select model", suffixes=(".gguf",))
+        if not model_path:
+            print("  cancelled")
+            return None
+        executable = input_path("Executable [llama-server]: ")
+        mmproj_path = select_path("Select MMProj (optional)", optional=True, suffixes=(".gguf",))
+        draft_model_path = select_path("Select draft model (optional)", optional=True, suffixes=(".gguf",))
+        extra_args = input("Extra args [optional]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  cancelled")
+        return None
+
+    create_args = ["create", name, model_path]
+    if executable:
+        create_args.extend(["--executable", executable])
+    if mmproj_path:
+        create_args.extend(["--mmproj", mmproj_path])
+    if draft_model_path:
+        create_args.extend(["--draft-model", draft_model_path])
+    if extra_args:
+        create_args.extend(["--extra-args", extra_args])
+
+    print("\nAdd initial flags as '<flag> <value>', 'toggle <flag>', or blank when done.")
+    while True:
+        try:
+            line = input("flag> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line:
+            break
+        try:
+            parts = shlex.split(line)
+        except ValueError as e:
+            print(f"  invalid input: {e}")
+            continue
+        if len(parts) == 2 and parts[0] == "toggle":
+            create_args.extend(["--toggle", parts[1]])
+        elif len(parts) >= 2:
+            create_args.extend(["--set", parts[0], " ".join(parts[1:])])
+        else:
+            print("  enter '<flag> <value>' or 'toggle <flag>'")
+
+    try:
+        cmd_create(data, history_path, create_args)
+    except SystemExit:
+        return None
+    reloaded = load_history(history_path)
+    data.clear()
+    data.update(reloaded)
+    return find_preset(data, name)
+
+
+def prompt_import_preset(data: dict, history_path: Path) -> dict | None:
+    print("\n── Import command ──")
+    try:
+        name = input("Preset name: ").strip()
+        if not name:
+            print("  cancelled")
+            return None
+        print("Paste launch command or args. End with a blank line.")
+        lines: list[str] = []
+        while True:
+            line = input("> ")
+            if not line.strip():
+                break
+            lines.append(line)
+    except (EOFError, KeyboardInterrupt):
+        print("\n  cancelled")
+        return None
+
+    command_text = " ".join(lines).strip()
+    if not command_text:
+        print("  cancelled")
+        return None
+    try:
+        cmd_import(data, history_path, name, command_text)
+    except SystemExit:
+        return None
+    reloaded = load_history(history_path)
+    data.clear()
+    data.update(reloaded)
+    return find_preset(data, name)
+
 
 def cmd_list(data: dict) -> None:
     presets = data.get("presets", [])
@@ -532,6 +1081,8 @@ def cmd_run(data: dict, name: str, auto: bool = False, history_path: Path | None
 HELP_TEXT = """Commands:
 
   list                        List all presets.
+  create  <name> <model>      Create a preset from a model path.
+  import  <name> <command>    Import a pasted launch command as a preset.
   show    <name>              Show preset details, flags, and values.
   set     <name> <flag> <val> Set or add a flag value. Creates the flag if missing, enables it.
   enable  <name> <flag>       Enable (tick) a flag. Creates as toggle if missing.
@@ -546,6 +1097,8 @@ HELP_TEXT = """Commands:
 
 HELP_DETAIL = {
     "list": "list\n    List all saved presets with their model file names.",
+    "create": "create <preset-name> <model-path> [options]\n    Create a new preset. Creates history.json if it does not exist.\n\n    Options:\n      --executable <path-or-command>   Server executable (default: llama-server)\n      --inferer <name>                 Inferer label (default: llama.cpp)\n      --mmproj <path>                  MMProj model path and enabled --mmproj flag\n      --draft-model <path>             Draft/speculative model path\n      --extra-args <args>              Extra server args, quoted as one value\n      --set <flag> <value>             Set and enable a valued flag; repeatable\n      --toggle <flag>                  Enable a toggle flag; repeatable\n      --force                          Replace an existing preset with same name\n\n    Example:\n      llamawrap-cli create \"My Model\" /models/model.gguf --set -ngl all --set -c 32768 --set --port 8080",
+    "import": "import <preset-name> <command-or-args...> [--force]\n    Import a llama-server command or launch args as a preset. Recognized\n    flags are stored as normal preset fields; unknown flags are preserved.\n\n    Examples:\n      llamawrap-cli import \"My Model\" llama-server -m /models/model.gguf -ngl all -c 32768\n      llamawrap-cli import \"Args Only\" -m /models/model.gguf --port 8080",
     "show": "show <preset-name>\n    Display the preset's inferer, executable, model paths, all flags,\n    their enabled/disabled status, and current values.",
     "set": "set <preset-name> <flag> <value>\n    Set a flag's value and enable it. If the flag doesn't exist in the\n    preset it is added automatically. Example:\n      llamawrap-cli set \"My Model\" --port 8080",
     "enable": "enable <preset-name> <flag>\n    Enable (check/tick) a flag so it is included when building the\n    server command. Creates the flag as a toggle (no value) if missing.\n    Example:\n      llamawrap-cli enable \"My Model\" --jinja",
@@ -575,29 +1128,45 @@ def cmd_help(args: list[str]) -> None:
 
 def interactive_browse(history_path: Path) -> None:
     """Interactive preset browser — default mode when no command is given."""
-    data = load_history(history_path)
+    data = load_or_init_history(history_path)
     presets = data.get("presets", [])
 
     while True:
         print("\n── Presets ──")
         if not presets:
-            print("  (no presets — create one in the GUI first)")
-            break
-        for i, p in enumerate(presets, 1):
-            name = p.get("preset_name", "?")
-            model = Path(p.get("model_path", "")).name or "(no model)"
-            print(f"  {i:>2}. {name}  ({model})")
+            print("  (no presets)")
+        else:
+            for i, p in enumerate(presets, 1):
+                name = p.get("preset_name", "?")
+                model = Path(p.get("model_path", "")).name or "(no model)"
+                print(f"  {i:>2}. {name}  ({model})")
         print()
         try:
-            choice = input("Enter number to select, r to reload, q to quit: ").strip()
+            choice = input("Enter number to select, c to create, i to import, r to reload, q to quit: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
         if choice == "q":
             break
+        if choice == "c":
+            created = prompt_create_preset(data, history_path)
+            presets = data.get("presets", [])
+            if created:
+                interactive_preset_shell(created, history_path, data)
+                data = load_history(history_path)
+                presets = data.get("presets", [])
+            continue
+        if choice == "i":
+            imported = prompt_import_preset(data, history_path)
+            presets = data.get("presets", [])
+            if imported:
+                interactive_preset_shell(imported, history_path, data)
+                data = load_history(history_path)
+                presets = data.get("presets", [])
+            continue
         if choice == "r":
-            data = load_history(history_path)
+            data = load_or_init_history(history_path)
             presets = data.get("presets", [])
             continue
 
@@ -781,21 +1350,32 @@ def main() -> None:
         cmd_help([])
         return
     if args[0] not in (
-        "list", "show", "set", "enable", "disable",
+        "list", "create", "import", "show", "set", "enable", "disable",
         "rmflag", "rename", "delete", "run", "help",
     ):
         print(f"unknown command: {args[0]}", file=sys.stderr)
         cmd_help([])
         sys.exit(1)
 
-    data = load_history(history_path)
     cmd = args[0]
-
     if cmd == "help":
         cmd_help(args)
+        return
 
-    elif cmd == "list":
+    data = load_or_init_history(history_path) if cmd in {"create", "import"} else load_history(history_path)
+
+    if cmd == "list":
         cmd_list(data)
+
+    elif cmd == "create":
+        cmd_create(data, history_path, args)
+
+    elif cmd == "import":
+        force = "--force" in args
+        filtered = [a for a in args[2:] if a != "--force"]
+        if len(args) < 3 or not filtered:
+            error("usage: llamawrap-cli import <preset-name> <command-or-args...> [--force]")
+        cmd_import(data, history_path, args[1], shlex.join(filtered), force=force)
 
     elif cmd == "show":
         if len(args) < 2:
