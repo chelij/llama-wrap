@@ -13,8 +13,8 @@ It is not a chat UI, model downloader, or model manager.
 ### From Source
 
 ```bash
-git clone <repo-url>
-cd llama-launch-ui
+git clone https://github.com/chelij/llama-wrap.git
+cd llama-wrap
 python llamawrap.py
 ```
 
@@ -337,6 +337,17 @@ The GUI Diagnostics row runs these actions in the background and streams readabl
 
 The CLI exposes the same diagnostics through `doctor`, `probe`, `bench`, and `stress`.
 
+Example diagnostic output:
+
+```text
+Doctor: My Model
+  executable       PASS  llama-server found
+  model path       PASS  /models/model.gguf
+  endpoint         PASS  http://127.0.0.1:8080
+  /v1/models       PASS  model list returned
+  chat completion  PASS  42 tokens/sec estimate available
+```
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -363,6 +374,10 @@ The CLI does not require Tkinter.
 - provide a hosted server
 
 It is a small local process wrapper for people who already use `llama-server`-compatible inferers.
+
+## License
+
+MIT License. See [LICENSE](LICENSE).
 
 ## Support
 
