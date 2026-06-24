@@ -20,6 +20,8 @@ from typing import Any
 import urllib.request as urllib_req
 import webbrowser
 
+import llamawrap_core as core
+
 try:
     import tkinter as tk
     from tkinter import messagebox, simpledialog, ttk
@@ -36,7 +38,7 @@ TK_TCL_ERROR = tk.TclError if tk is not None else RuntimeError
 APP_TITLE = "llama-wrap"
 DEFAULT_SERVER_PORT = 8080
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-HISTORY_FILE = APP_DIR / "history.json"
+HISTORY_FILE = Path(os.environ["LLAMA_WRAP_HISTORY"]).expanduser() if os.environ.get("LLAMA_WRAP_HISTORY") else APP_DIR / "history.json"
 GB = 1024**3
 
 # Known llama-server flags for the "Add flag" suggestion dropdown.
@@ -558,6 +560,7 @@ class LauncherApp:
         self.vram_source = "GPU not detected"
         self.model_loaded = False
         self.intentional_stop = False
+        self._stop_logged = False
         self.extra_args_var: tk.StringVar | None = None
         self.inferer_var: tk.StringVar | None = None
         self.inferer_executable_var: tk.StringVar | None = None
@@ -570,6 +573,13 @@ class LauncherApp:
         self._session_gen_time_ms: float = 0.0
         self._session_stats_var: tk.StringVar | None = None
         self._auto_restart_count: int = 0
+        self.diagnostics_busy = False
+        self._vram_command: list[str] = []
+        self._vram_command_hash: str = ""
+        self._vram_baseline_total_used: int | None = None
+        self._vram_log_allocations: dict[str, int] = {}
+        self._vram_calibration_saved_for_hash: str = ""
+        self._vram_calibration_wait_logged = False
         self.loading_preset = False
         self._server_ready: bool = False
         self._health_check_timer: str | None = None
@@ -1029,6 +1039,29 @@ class LauncherApp:
             height=2,
         )
         self.command_label.grid(row=0, column=1, sticky="ew")
+
+        diagnostics_panel = self.make_panel(right, padx=14, pady=12)
+        diagnostics_panel.grid(row=3, column=0, sticky="ew", pady=(0, 12))
+        diagnostics_panel.columnconfigure(1, weight=1)
+        tk.Label(diagnostics_panel, text="Diagnostics", bg=self.colors["panel"], fg=self.colors["text"], font=("TkDefaultFont", 12, "bold")).grid(
+            row=0, column=0, sticky="w", padx=(0, 14)
+        )
+        diagnostics_buttons = tk.Frame(diagnostics_panel, bg=self.colors["panel"])
+        diagnostics_buttons.grid(row=0, column=1, sticky="ew")
+        for col in range(4):
+            diagnostics_buttons.columnconfigure(col, weight=1, uniform="diagnostics_buttons")
+        doctor_button = self.make_button(diagnostics_buttons, "Doctor", self.run_diagnostics_doctor, width=78, bg=self.colors["panel_soft"])
+        doctor_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        Tooltip(doctor_button, "Doctor\n\nCheck executable, model paths, port, and OpenAI-compatible endpoints.")
+        probe_button = self.make_button(diagnostics_buttons, "Probe", self.run_diagnostics_probe, width=78, bg=self.colors["panel_soft"])
+        probe_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        Tooltip(probe_button, "Probe\n\nSend one small chat completion request to the configured endpoint.")
+        bench_button = self.make_button(diagnostics_buttons, "Bench", self.run_diagnostics_bench, width=78, bg=self.colors["panel_soft"])
+        bench_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        Tooltip(bench_button, "Bench\n\nRun one short benchmark request and save JSON results locally.")
+        stress_button = self.make_button(diagnostics_buttons, "Stress", self.run_diagnostics_stress, width=78, bg=self.colors["warn"])
+        stress_button.grid(row=0, column=3, sticky="ew")
+        Tooltip(stress_button, "Stress\n\nSend a large prompt to fill most of the configured context window.")
 
         output_panel = self.make_panel(right, padx=14, pady=12)
         output_panel.grid(row=4, column=0, sticky="nsew")
@@ -1564,27 +1597,7 @@ class LauncherApp:
             messagebox.showwarning("No preset selected", "Select a preset to save, or use Save as to create a new one.", parent=self.root)
             return
         name = self.selected_preset
-        preset = {
-            "format_version": 1,
-            "preset_name": name.strip(),
-            "inferer": self.current_inferer_key(),
-            "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
-            "model_path": self.model_var.get().strip(),
-            "mmproj_path": self.flags["--mmproj"].value,
-            "draft_model_path": self.draft_model_var.get().strip() if self.draft_model_var else "",
-            "extra_args": self.extra_args_var.get().strip() if self.extra_args_var else "",
-            "hidden_flags": sorted(self.hidden_flags),
-            "flags": {
-                flag: {
-                    "value": cfg.value,
-                    "enabled": cfg.enabled,
-                    "value_required": cfg.value_required,
-                    "custom": cfg.custom,
-                    "step_mode": cfg.step_mode,
-                }
-                for flag, cfg in self.flags.items()
-            },
-        }
+        preset = self.current_preset_payload(name)
         self.history.upsert_preset(preset)
         self.saved_snapshot = self.snapshot_state()
         self.dirty = False
@@ -1595,9 +1608,18 @@ class LauncherApp:
         name = simpledialog.askstring("Save preset as", "Preset name:", initialvalue=default, parent=self.root)
         if not name:
             return
-        preset = {
+        preset = self.current_preset_payload(name)
+        self.history.upsert_preset(preset)
+        self.selected_preset = name.strip()
+        self.saved_snapshot = self.snapshot_state()
+        self.dirty = False
+        self.render_presets()
+
+    def current_preset_payload(self, name: str | None = None) -> dict[str, Any]:
+        preset_name = (name or self.selected_preset or Path(self.model_var.get()).stem or "Unsaved").strip()
+        payload = {
             "format_version": 1,
-            "preset_name": name.strip(),
+            "preset_name": preset_name,
             "inferer": self.current_inferer_key(),
             "inferer_executable": self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable,
             "model_path": self.model_var.get().strip(),
@@ -1616,11 +1638,15 @@ class LauncherApp:
                 for flag, cfg in self.flags.items()
             },
         }
-        self.history.upsert_preset(preset)
-        self.selected_preset = name.strip()
-        self.saved_snapshot = self.snapshot_state()
-        self.dirty = False
-        self.render_presets()
+        for existing in self.history.presets:
+            if existing.get("preset_name") != preset_name:
+                continue
+            if "session_stats" in existing:
+                payload["session_stats"] = existing["session_stats"]
+            if "vram_calibration" in existing:
+                payload["vram_calibration"] = existing["vram_calibration"]
+            break
+        return payload
 
     def import_command_dialog(self) -> None:
         dialog = tk.Toplevel(self.root)
@@ -2204,6 +2230,8 @@ class LauncherApp:
 
     def estimate_confidence(self) -> tuple[str, str]:
         """Returns (label, color) where color is a hex color for the badge dot."""
+        if self.estimate.get("calibrated"):
+            return ("calibrated", self.colors["conf_green"])
         if not self.model_meta:
             return ("no model selected", self.colors["conf_red"])
         if self.model_meta.n_layers and self.model_meta.n_embd_k_gqa and self.model_meta.n_embd_v_gqa:
@@ -2211,6 +2239,45 @@ class LauncherApp:
         if self.model_meta.n_layers and self.model_meta.n_embd and self.model_meta.n_kv_heads:
             return ("partial metadata", self.colors["conf_yellow"])
         return ("file-size only", self.colors["conf_red"])
+
+    def matching_vram_calibration(self) -> dict[str, Any] | None:
+        if not self.selected_preset:
+            return None
+        preset = None
+        for candidate in self.history.presets:
+            if candidate.get("preset_name") == self.selected_preset:
+                preset = candidate
+                break
+        if not preset:
+            return None
+        calibration = preset.get("vram_calibration")
+        if not self.vram_calibration_is_plausible(calibration):
+            return None
+        try:
+            command = self.build_command(validate_model=False)
+        except Exception:
+            return None
+        if core.calibration_matches(calibration, command, self.model_var.get().strip()):
+            return calibration
+        return None
+
+    def vram_calibration_is_plausible(self, calibration: Any) -> bool:
+        if not isinstance(calibration, dict):
+            return False
+        observed = calibration.get("observed_bytes")
+        estimated = calibration.get("estimated_bytes")
+        try:
+            observed_value = float(observed)
+            estimated_value = float(estimated)
+        except (TypeError, ValueError):
+            return False
+        if observed_value <= 0 or estimated_value <= 0:
+            return False
+        log_allocations = calibration.get("log_allocations") if isinstance(calibration.get("log_allocations"), dict) else {}
+        if log_allocations:
+            return True
+        ratio = observed_value / estimated_value
+        return ratio >= 0.20
 
     def recalculate_vram(self) -> None:
         meta = self.model_meta
@@ -2285,6 +2352,17 @@ class LauncherApp:
             "k_dim": float(k_dim),
             "v_dim": float(v_dim),
         }
+        calibration = self.matching_vram_calibration()
+        if calibration and calibration.get("observed_bytes"):
+            calibrated = int(calibration["observed_bytes"])
+            self.estimate.update(
+                {
+                    "calibrated": calibrated,
+                    "calibration_ratio": calibration.get("correction_ratio"),
+                    "calibration_source": calibration.get("observed_source", "runtime"),
+                    "calibration_created_at": calibration.get("created_at", ""),
+                }
+            )
         self.update_command_preview()
         self.update_vram_ui()
 
@@ -2306,15 +2384,57 @@ class LauncherApp:
         self.root.update()
         self.command_var.set(command_text)
 
+    def _run_diagnostics_task(self, label: str, worker: Any) -> None:
+        if self.diagnostics_busy:
+            self.append_log("warn", "Diagnostics already running.")
+            return
+        preset = self.current_preset_payload()
+        self.diagnostics_busy = True
+        self.append_log("normal", f"── {label} ──")
+
+        def run() -> None:
+            try:
+                ok, lines = worker(preset)
+                for line in lines:
+                    self.append_log("error" if line.startswith("[FAIL]") else "normal", line)
+                if not ok:
+                    self.append_log("error", f"{label} failed.")
+            except Exception as exc:
+                self.append_log("error", f"{label} failed: {exc}")
+            finally:
+                self.root.after(0, self._finish_diagnostics_task)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _finish_diagnostics_task(self) -> None:
+        self.diagnostics_busy = False
+
+    def run_diagnostics_doctor(self) -> None:
+        self._run_diagnostics_task("Doctor", lambda preset: core.doctor_report(preset))
+
+    def run_diagnostics_probe(self) -> None:
+        self._run_diagnostics_task("Probe", lambda preset: core.probe_report(preset))
+
+    def run_diagnostics_bench(self) -> None:
+        def worker(preset: dict[str, Any]) -> tuple[bool, list[str]]:
+            row, _paths, lines = core.run_benchmark(preset)
+            return row.get("status") == "pass", lines
+
+        self._run_diagnostics_task("Bench", worker)
+
+    def run_diagnostics_stress(self) -> None:
+        self._run_diagnostics_task("Stress", lambda preset: core.context_stress_report(preset))
+
     def update_vram_ui(self) -> None:
         process_running = self.process is not None and self.process.poll() is None
         has_runtime = process_running and self.vram_used is not None
-        used = self.vram_used if has_runtime else self.estimate.get("estimated", 0.0)
+        idle_estimate = self.estimate.get("calibrated", self.estimate.get("estimated", 0.0))
+        used = self.vram_used if has_runtime else idle_estimate
         total = self.vram_total
         total_used = self.vram_total_used
         percent = min(100.0, (used / total) * 100) if used and total else 0.0
         self.draw_vram_bar(percent)
-        prefix = "Server" if has_runtime else "Estimated"
+        prefix = "Server" if has_runtime else "Calibrated" if self.estimate.get("calibrated") else "Estimated"
         bits = [f"{prefix} {human_bytes(used)}"]
         if total_used and total:
             bits.append(f"| GPU {human_bytes(total_used)} / {human_bytes(total)}")
@@ -2389,21 +2509,33 @@ class LauncherApp:
         canvas.delete("all")
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
-        total = self.vram_total or self.estimate.get("estimated", 0.0)
+        total = self.vram_total or self.estimate.get("calibrated", self.estimate.get("estimated", 0.0))
         if not total:
             return
-        segments = [
-            ("weights", "#5b8ec9", "MODEL", "#ffffff"),
-            ("kv", "#c9a04e", "KV", "#0a0d14"),
-            ("mtp_kv", "#c4608a", "MTP", "#ffffff"),
-            ("draft", "#8a6cc7", "DRAFT", "#ffffff"),
-            ("mmproj", "#5a9060", "MMPROJ", "#ffffff"),
-            ("overhead", "#c95a4e", "OVERHEAD", "#ffffff"),
+        base_segments = [
+            ("weights", max(0.0, float(self.estimate.get("weights", 0.0))), "#5b8ec9", "MODEL", "#ffffff"),
+            ("kv", max(0.0, float(self.estimate.get("kv", 0.0))), "#c9a04e", "KV", "#0a0d14"),
+            ("mtp_kv", max(0.0, float(self.estimate.get("mtp_kv", 0.0))), "#c4608a", "MTP", "#ffffff"),
+            ("draft", max(0.0, float(self.estimate.get("draft", 0.0))), "#8a6cc7", "DRAFT", "#ffffff"),
+            ("mmproj", max(0.0, float(self.estimate.get("mmproj", 0.0))), "#5a9060", "MMPROJ", "#ffffff"),
+            ("overhead", max(0.0, float(self.estimate.get("overhead", 0.0))), "#c95a4e", "OVERHEAD", "#ffffff"),
         ]
+        formula_total = sum(size for _key, size, _color, _short, _text_color in base_segments)
+        calibrated = max(0.0, float(self.estimate.get("calibrated", 0.0) or 0.0))
+        segments = base_segments
+        if calibrated and formula_total > 0 and calibrated < formula_total:
+            scale = calibrated / formula_total
+            segments = [
+                (key, size * scale, color, short, text_color)
+                for key, size, color, short, text_color in base_segments
+            ]
+        elif calibrated and calibrated > formula_total:
+            segments = [*base_segments, ("calibrated_delta", calibrated - formula_total, "#6b7280", "CAL", "#ffffff")]
+        elif calibrated and formula_total <= 0:
+            segments = [("calibrated", calibrated, "#6b7280", "CAL", "#ffffff")]
         x = 0.0
         label_y = height // 2
-        for key, color, short, text_color in segments:
-            size = max(0.0, float(self.estimate.get(key, 0.0)))
+        for _key, size, color, short, text_color in segments:
             segment_width = (size / total) * width
             if segment_width <= 0:
                 continue
@@ -2444,66 +2576,24 @@ class LauncherApp:
             f"MMProj {human_bytes(self.estimate.get('mmproj', 0.0))}",
             f"Overhead {human_bytes(self.estimate.get('overhead', 0.0))}",
         ])
+        if self.estimate.get("calibrated"):
+            parts.append(f"Calibrated {human_bytes(self.estimate.get('calibrated', 0.0))}")
         legend = "Model blue + Context gold + MTP rose + Draft violet + MMProj green + Overhead coral\n"
         meta = self.model_meta
         sw_text = f" | SWA: {meta.sliding_window} (KV est. uses SWA window)" if meta and meta.sliding_window else ""
         self.vram_breakdown_var.set(
             legend
             + " + ".join(parts)
-            + f" = {human_bytes(self.estimate.get('estimated', 0.0))}\n"
+            + f" = {human_bytes(self.estimate.get('calibrated', self.estimate.get('estimated', 0.0)))}\n"
             + f"-c: {int(self.estimate.get('context', 0.0))} tok | K {int(self.estimate.get('k_dim', 0.0))}, V {int(self.estimate.get('v_dim', 0.0))} | -ngl: {layer_text} | confidence: {conf_label}{sw_text}"
         )
 
     def build_command(self, validate_model: bool = True) -> list[str]:
-        model_path = self.model_var.get().strip()
-        if not model_path:
-            raise ValueError("model path is required")
-        if validate_model and not Path(model_path).expanduser().exists():
-            raise ValueError("model path does not exist")
-        executable = self.inferer_executable_var.get().strip() if self.inferer_executable_var else self.current_inferer().executable
-        if not executable:
-            raise ValueError("inferer executable is required")
-        try:
-            command = shlex.split(executable)
-        except ValueError as exc:
-            raise ValueError(f"inferer executable is not valid shell-style text: {exc}") from exc
-        if not command:
-            raise ValueError("inferer executable is required")
-        command.extend(["-m", model_path])
-        draft_model_path = self.draft_model_var.get().strip() if self.draft_model_var else ""
-        if draft_model_path:
-            if validate_model and not Path(draft_model_path).expanduser().exists():
-                raise ValueError("draft model path does not exist")
-            command.extend(["-md", draft_model_path])
-        fit_enabled = "--fit" in self.flags and self.flags["--fit"].enabled and self.flag_supported_by_current_inferer("--fit")
-        ngl_enabled = "-ngl" in self.flags and self.flags["-ngl"].enabled and bool(self.flags["-ngl"].value.strip())
-        for flag, cfg in self.flags.items():
-            if not cfg.enabled:
-                continue
+        preset = self.current_preset_payload()
+        for flag, cfg in preset.get("flags", {}).items():
             if not self.flag_supported_by_current_inferer(flag):
-                continue
-            if fit_enabled and flag == "-ngl":
-                continue
-            # Modern llama.cpp has --fit on by default. When -ngl is explicitly
-            # set, add --fit off to avoid: "n_gpu_layers already set by user, abort"
-            if flag == "-ngl" and ngl_enabled and not fit_enabled:
-                command.extend(["--fit", "off"])
-            if flag == "--mmproj" and not cfg.value.strip():
-                continue
-            if cfg.value_required:
-                if cfg.value.strip():
-                    command.extend([flag, cfg.value.strip()])
-            else:
-                command.append(flag)
-        if self.extra_args_var and self.extra_args_var.get().strip():
-            try:
-                command.extend(shlex.split(self.extra_args_var.get().strip()))
-            except ValueError as exc:
-                raise ValueError(f"extra args are not valid shell-style arguments: {exc}") from exc
-        # Always enable --metrics so the /metrics endpoint is available
-        if "--metrics" not in command:
-            command.append("--metrics")
-        return command
+                cfg["enabled"] = False
+        return core.build_command_from_preset(preset, validate_paths=validate_model)
 
     def launch(self) -> None:
         try:
@@ -2523,7 +2613,9 @@ class LauncherApp:
     def start_process(self, command: list[str], add_separator: bool = False) -> None:
         self.model_loaded = False
         self._server_ready = False
+        self._stop_logged = False
         self.reset_session_stats()
+        self.reset_vram_calibration_session(command)
         self.kill_existing_on_port(self.get_int_flag("--port", DEFAULT_SERVER_PORT))
         if add_separator:
             self.append_log("warn", "Auto-restarting inferer...")
@@ -2544,6 +2636,18 @@ class LauncherApp:
         except Exception as exc:
             self.set_status("Error")
             self.append_log("error", f"Launch failed: {exc}")
+
+    def reset_vram_calibration_session(self, command: list[str]) -> None:
+        self._vram_command = list(command)
+        self._vram_command_hash = core.command_hash(command)
+        self._vram_log_allocations = {}
+        self._vram_calibration_saved_for_hash = ""
+        self._vram_calibration_wait_logged = False
+        try:
+            _used, total_used, _total, _source = self.gpu.usage(None)
+        except Exception:
+            total_used = None
+        self._vram_baseline_total_used = total_used
 
     def kill_existing_on_port(self, port: int) -> None:
         if os.name == "nt" or not shutil.which("lsof"):
@@ -2581,17 +2685,25 @@ class LauncherApp:
                     self.process.terminate()
             except Exception:
                 self.process.terminate()
+            self.set_status("Stopping")
+        else:
+            self.set_status("Stopped")
+            if not self._stop_logged:
+                self.append_log("normal", "Server already stopped.")
+                self._stop_logged = True
         self._server_ready = False
-        self.set_status("Stopped")
         self._save_session_stats_to_preset()
 
     def refresh_process_state(self) -> None:
-        if self.process and self.process.poll() is not None and self.status_var.get() in {"Launching", "Running", "Ready"}:
+        if self.process and self.process.poll() is not None and self.status_var.get() in {"Launching", "Running", "Ready", "Stopping"}:
             code = self.process.returncode
             self._stop_health_check()
             self._server_ready = False
             if code == 0 or self.intentional_stop:
                 self.set_status("Stopped")
+                if self.intentional_stop and not self._stop_logged:
+                    self.append_log("normal", "Server stopped.")
+                    self._stop_logged = True
             else:
                 self.set_status("Crashed")
                 self.append_log("error", f"inferer exited with code {code}")
@@ -2610,6 +2722,8 @@ class LauncherApp:
         process_running = self.process is not None and self.process.poll() is None
         target_pid = self.process.pid if process_running else None
         self.vram_used, self.vram_total_used, self.vram_total, self.vram_source = self.gpu.usage(target_pid)
+        if process_running and self.model_loaded:
+            self.maybe_save_vram_calibration()
         self.update_vram_ui()
         # Poll every 2s while server is running, every 30s when idle
         interval = 2000 if process_running else 30000
@@ -2627,6 +2741,7 @@ class LauncherApp:
             colors = {
                 "Stopped": self.colors["panel_soft"],
                 "Launching": self.colors["warn"],
+                "Stopping": self.colors["warn"],
                 "Running": self.colors["accent"],
                 "Ready": self.colors["good"],
                 "Error": self.colors["danger"],
@@ -2676,6 +2791,7 @@ class LauncherApp:
         self._server_ready = True
         self._health_check_timer = None
         self.set_status("Ready")
+        self.maybe_save_vram_calibration()
         self.append_log("normal", f"Server ready at {self._get_server_url()}")
 
     def classify_log(self, line: str) -> str:
@@ -2702,6 +2818,88 @@ class LauncherApp:
         self._session_gen_time_ms = 0.0
         if self._session_stats_var:
             self._session_stats_var.set("")
+
+    def capture_vram_allocation(self, text: str) -> None:
+        event = core.parse_llama_vram_log_line(text)
+        if not event:
+            return
+        category, bytes_used = event
+        self._vram_log_allocations[category] = self._vram_log_allocations.get(category, 0) + bytes_used
+
+    def observed_vram_for_calibration(self, *, fresh: bool = False) -> tuple[int, str] | None:
+        vram_used = self.vram_used
+        total_used = self.vram_total_used
+        source = self.vram_source
+        if fresh and self.process and self.process.poll() is None:
+            try:
+                vram_used, total_used, self.vram_total, source = self.gpu.usage(self.process.pid)
+                self.vram_used = vram_used
+                self.vram_total_used = total_used
+                self.vram_source = source
+            except Exception:
+                pass
+        if vram_used and vram_used > 0:
+            source = self.vram_source or "GPU process usage"
+            if "AMD" not in source.upper():
+                return int(vram_used), source
+        if total_used is not None and self._vram_baseline_total_used is not None:
+            delta = total_used - self._vram_baseline_total_used
+            if delta > 0:
+                return int(delta), f"{source} total delta"
+        log_total = sum(self._vram_log_allocations.values())
+        if log_total > 0:
+            return int(log_total), "llama-server allocation logs"
+        return None
+
+    def maybe_save_vram_calibration(self) -> None:
+        if not self.selected_preset or not self._vram_command_hash:
+            return
+        observed = self.observed_vram_for_calibration(fresh=True)
+        estimated = float(self.estimate.get("estimated", 0.0))
+        if not observed or estimated <= 0:
+            return
+        observed_bytes, observed_source = observed
+        log_total = sum(self._vram_log_allocations.values())
+        if not log_total and observed_bytes < estimated * 0.20:
+            if not self._vram_calibration_wait_logged:
+                self.append_log(
+                    "warn",
+                    f"VRAM calibration waiting for stable GPU reading: observed {human_bytes(observed_bytes)} vs estimate {human_bytes(estimated)}.",
+                )
+                self._vram_calibration_wait_logged = True
+            return
+        preset = None
+        for candidate in self.history.presets:
+            if candidate.get("preset_name") == self.selected_preset:
+                preset = candidate
+                break
+        if preset is None:
+            return
+        existing = preset.get("vram_calibration") if isinstance(preset.get("vram_calibration"), dict) else None
+        if existing and core.calibration_matches(existing, self._vram_command, self.model_var.get().strip()):
+            existing_observed = int(existing.get("observed_bytes") or 0)
+            if self._vram_calibration_saved_for_hash == self._vram_command_hash and observed_bytes <= existing_observed * 1.05:
+                return
+            if observed_bytes <= existing_observed and self.vram_calibration_is_plausible(existing):
+                return
+        calibration = core.make_vram_calibration(
+            preset_name=self.selected_preset,
+            command=self._vram_command,
+            model_path=self.model_var.get().strip(),
+            estimated_bytes=estimated,
+            observed_bytes=observed_bytes,
+            observed_source=observed_source,
+            log_allocations=self._vram_log_allocations,
+        )
+        preset["vram_calibration"] = calibration
+        self.history.upsert_preset(preset)
+        self._vram_calibration_saved_for_hash = self._vram_command_hash
+        self.recalculate_vram()
+        self.append_log(
+            "normal",
+            f"VRAM calibrated: observed {human_bytes(observed_bytes)} from {observed_source}; "
+            f"estimate ratio {calibration.get('correction_ratio')}",
+        )
 
     def _update_session_display(self) -> None:
         if not self._session_stats_var:
@@ -2743,6 +2941,7 @@ class LauncherApp:
         if threading.current_thread() is not threading.main_thread():
             self.log_queue.put((level, text))
             return
+        self.capture_vram_allocation(text)
         self.capture_tokens_per_second(text)
         self.update_status_from_log(text)
         self.output.configure(state="normal")
@@ -2846,7 +3045,8 @@ class LauncherApp:
 
 CLI_COMMANDS = {
     "list", "create", "import", "show", "set", "enable", "disable",
-    "rmflag", "rename", "delete", "run", "help",
+    "rmflag", "rename", "delete", "run", "doctor", "probe", "bench",
+    "stress", "export-presets", "import-presets", "help",
 }
 
 

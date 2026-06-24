@@ -5,7 +5,9 @@ __pycache__/
 
 build/
 dist/
+llama-wrap/
 *.spec
 
 history.json
 settings.yml
+.llama-wrap/

@@ -28,13 +28,17 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from pathlib import Path
+
+import llamawrap_core as core
 
 
 def find_history() -> Path:
     """Locate history.json next to the script or in the working directory."""
+    env_path = os.environ.get("LLAMA_WRAP_HISTORY")
+    if env_path:
+        return Path(env_path).expanduser()
     candidates = [
         Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None,
         Path(__file__).resolve().parent,
@@ -92,111 +96,12 @@ def error(msg: str) -> None:
     sys.exit(1)
 
 
-ALIAS_TO_FLAG = {
-    "--model": "-m",
-    "-m": "-m",
-    "--gpu-layers": "-ngl",
-    "--n-gpu-layers": "-ngl",
-    "-ngl": "-ngl",
-    "--ctx-size": "-c",
-    "-c": "-c",
-    "--threads": "-t",
-    "-t": "-t",
-    "--threads-batch": "-tb",
-    "-tb": "-tb",
-    "--flash-attn": "-fa",
-    "-fa": "-fa",
-    "--cache-type-k": "-ctk",
-    "-ctk": "-ctk",
-    "--cache-type-v": "-ctv",
-    "-ctv": "-ctv",
-    "--port": "--port",
-    "--host": "--host",
-    "--batch-size": "-b",
-    "-b": "-b",
-    "--ubatch-size": "-ub",
-    "-ub": "-ub",
-    "--parallel": "-np",
-    "-np": "-np",
-    "--alias": "-a",
-    "-a": "-a",
-    "--timeout": "-to",
-    "-to": "-to",
-    "--mmproj": "--mmproj",
-    "-mm": "--mmproj",
-    "--spec-draft-model": "-md",
-    "--model-draft": "-md",
-    "-md": "-md",
-    "--spec-type": "--spec-type",
-    "--spec-draft-n-max": "--spec-draft-n-max",
-    "--draft-max": "--spec-draft-n-max",
-    "--draft": "--spec-draft-n-max",
-    "--spec-draft-n-min": "--spec-draft-n-min",
-    "--draft-min": "--spec-draft-n-min",
-    "--spec-draft-p-min": "--spec-draft-p-min",
-    "--draft-p-min": "--spec-draft-p-min",
-    "--spec-draft-ngl": "-ngld",
-    "--gpu-layers-draft": "-ngld",
-    "--n-gpu-layers-draft": "-ngld",
-    "-ngld": "-ngld",
-    "--jinja": "--jinja",
-    "--fit": "--fit",
-    "--fit-margin": "--fit-margin",
-    "-mla": "-mla",
-    "--mla-use": "-mla",
-    "-fmoe": "-fmoe",
-    "--fused-moe": "-fmoe",
-    "-cram": "-cram",
-    "--cache-ram": "-cram",
-    "-khad": "-khad",
-    "--k-cache-hadamard": "-khad",
-    "-vhad": "-vhad",
-    "--v-cache-hadamard": "-vhad",
-    "-ncmoe": "-ncmoe",
-    "--n-cpu-moe": "-ncmoe",
-    "--cpu-moe": "-ncmoe",
-    "--reasoning": "--reasoning",
-    "-rea": "--reasoning",
-}
-
-
 # ───────────────────────────────────────
 #  Commands
 # ───────────────────────────────────────
 
 def default_cli_flags() -> dict:
-    return {
-        "-ngl": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--fit": {"value": "on", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--fit-margin": {"value": "1024", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-cram": {"value": "8192", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-ncmoe": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-c": {"value": "4096", "enabled": False, "value_required": True, "custom": False, "step_mode": "context"},
-        "-ctk": {"value": "f16", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-ctv": {"value": "f16", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-khad": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
-        "-vhad": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
-        "-t": {"value": "-1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-tb": {"value": "-1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-fa": {"value": "auto", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-mla": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-fmoe": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
-        "--port": {"value": "8080", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--host": {"value": "127.0.0.1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-np": {"value": "1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-a": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-to": {"value": "600", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-b": {"value": "2048", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-ub": {"value": "512", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--spec-type": {"value": "none", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--spec-draft-n-max": {"value": "16", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--spec-draft-n-min": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--spec-draft-p-min": {"value": "0.75", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-ngld": {"value": "0", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--reasoning": {"value": "auto", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "--jinja": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
-        "--mmproj": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-    }
+    return core.default_cli_flags()
 
 
 def parse_create_args(args: list[str]) -> dict:
@@ -301,99 +206,8 @@ def cmd_create(data: dict, path: Path, args: list[str]) -> None:
     print(f"  created preset '{name}'")
 
 
-def consume_import_value(tokens: list[str], idx: int, inline_value: str | None, flag: str) -> tuple[str, int]:
-    if inline_value is not None:
-        return inline_value, idx
-    if idx + 1 >= len(tokens):
-        raise ValueError(f"{flag} needs a value.")
-    return tokens[idx + 1], idx + 1
-
-
 def preset_from_command(name: str, command_text: str) -> tuple[dict, int, list[str]]:
-    if not command_text.strip():
-        raise ValueError("Paste a server command first.")
-    try:
-        tokens = shlex.split(command_text)
-    except ValueError as exc:
-        raise ValueError(f"Could not read the command: {exc}") from exc
-    if not tokens:
-        raise ValueError("Paste a server command first.")
-
-    executable = "llama-server"
-    if tokens[0] and not tokens[0].startswith("-"):
-        executable = tokens[0]
-        tokens = tokens[1:]
-
-    flags = default_cli_flags()
-    valueless_flags = {flag for flag, cfg in flags.items() if not cfg.get("value_required", True)}
-    model_path = ""
-    mmproj_path = ""
-    draft_model_path = ""
-    extra_tokens: list[str] = []
-    skipped: list[str] = []
-    changed = 0
-    idx = 0
-    while idx < len(tokens):
-        token = tokens[idx]
-        if token.startswith("--") and "=" in token:
-            token, inline_value = token.split("=", 1)
-        else:
-            inline_value = None
-
-        if token in {"-m", "--model"}:
-            model_path, idx = consume_import_value(tokens, idx, inline_value, token)
-            changed += 1
-        elif token in ALIAS_TO_FLAG:
-            flag = ALIAS_TO_FLAG[token]
-            if flag in valueless_flags:
-                value = inline_value or ""
-            else:
-                value, idx = consume_import_value(tokens, idx, inline_value, token)
-            if flag == "--mmproj":
-                mmproj_path = value
-                flags["--mmproj"]["value"] = value
-                flags["--mmproj"]["enabled"] = bool(value)
-            elif flag == "-md":
-                draft_model_path = value
-            elif flag in flags:
-                flags[flag]["value"] = value
-                flags[flag]["enabled"] = True
-            else:
-                skipped.append(token)
-                extra_tokens.extend([token, value])
-            changed += 1
-        elif token.startswith("-"):
-            value = inline_value or ""
-            value_required = inline_value is not None
-            if inline_value is None and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
-                idx += 1
-                value = tokens[idx]
-                value_required = True
-            flags[token] = {
-                "value": value,
-                "enabled": True,
-                "value_required": value_required,
-                "custom": True,
-                "step_mode": "",
-            }
-            changed += 1
-        else:
-            extra_tokens.append(token)
-        idx += 1
-
-    preset = {
-        "format_version": 1,
-        "preset_name": name.strip(),
-        "inferer": "llama.cpp" if Path(executable).name == "llama-server" else "Custom",
-        "inferer_executable": executable,
-        "model_path": model_path,
-        "mmproj_path": mmproj_path,
-        "draft_model_path": draft_model_path,
-        "extra_args": shlex.join(extra_tokens) if extra_tokens else "",
-        "hidden_flags": [],
-        "flags": flags,
-    }
-    return preset, changed, skipped
+    return core.preset_from_command(name, command_text)
 
 
 def cmd_import(data: dict, path: Path, name: str, command_text: str, *, force: bool = False) -> None:
@@ -786,61 +600,10 @@ def cmd_delete(data: dict, path: Path, name: str) -> None:
 
 def build_command_from_preset(preset: dict) -> list[str]:
     """Build the server command list from a preset dict (same logic as the GUI)."""
-    executable = preset.get("inferer_executable", "llama-server")
     try:
-        command = shlex.split(executable)
-    except ValueError as e:
-        error(f"invalid executable in preset: {e}")
-    if not command:
-        error("executable is required")
-
-    model_path = preset.get("model_path", "").strip()
-    if not model_path:
-        error("preset has no model path set")
-    command.extend(["-m", model_path])
-
-    draft_path = (preset.get("draft_model_path") or "").strip()
-    if draft_path:
-        command.extend(["-md", draft_path])
-
-    flags = preset.get("flags", {})
-    fit_enabled = any(
-        f == "--fit" and isinstance(c, dict) and c.get("enabled", False)
-        for f, c in flags.items()
-    )
-    ngl_enabled = any(
-        f == "-ngl" and isinstance(c, dict) and c.get("enabled", False) and c.get("value", "").strip()
-        for f, c in flags.items()
-    )
-    # Inferer check for ik-specific flags — skip if no ik support needed
-    for fname, cfg in sorted(flags.items()):
-        if not isinstance(cfg, dict) or not cfg.get("enabled", False):
-            continue
-        if fit_enabled and fname == "-ngl":
-            continue
-        if fname == "-ngl" and ngl_enabled and not fit_enabled:
-            command.extend(["--fit", "off"])
-        if fname == "--mmproj" and not cfg.get("value", "").strip():
-            continue
-        if cfg.get("value_required", True):
-            val = cfg.get("value", "").strip()
-            if val:
-                command.extend([fname, val])
-        else:
-            command.append(fname)
-
-    extra = (preset.get("extra_args") or "").strip()
-    if extra:
-        try:
-            command.extend(shlex.split(extra))
-        except ValueError as e:
-            error(f"invalid extra_args in preset: {e}")
-
-    # Always enable --metrics so the /metrics endpoint is available
-    if "--metrics" not in command:
-        command.append("--metrics")
-
-    return command
+        return core.build_command_from_preset(preset)
+    except ValueError as exc:
+        error(str(exc))
 
 
 def _fetch_metrics(port: int, host: str = "127.0.0.1", timeout: float = 3.0) -> dict[str, float]:
@@ -1074,6 +837,106 @@ def cmd_run(data: dict, name: str, auto: bool = False, history_path: Path | None
     run_process(command, auto=auto, preset_name=name, history_path=history_path, port=port)
 
 
+def _require_preset(data: dict, name: str) -> dict:
+    preset = find_preset(data, name)
+    if not preset:
+        error(f"preset '{name}' not found")
+    return preset
+
+
+def cmd_doctor(data: dict, name: str) -> None:
+    preset = _require_preset(data, name)
+    ok, lines = core.doctor_report(preset)
+    for line in lines:
+        print(line)
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_probe(data: dict, name: str) -> None:
+    preset = _require_preset(data, name)
+    ok, lines = core.probe_report(preset)
+    for line in lines:
+        print(line)
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_bench(data: dict, args: list[str]) -> None:
+    if len(args) < 2:
+        error("usage: llamawrap-cli bench <preset-name> [--csv] [--out-dir <dir>]")
+    name = args[1]
+    csv_out = False
+    out_dir: Path | None = None
+    idx = 2
+    while idx < len(args):
+        arg = args[idx]
+        if arg == "--csv":
+            csv_out = True
+            idx += 1
+        elif arg == "--out-dir":
+            if idx + 1 >= len(args):
+                error("usage: --out-dir requires a directory")
+            out_dir = Path(args[idx + 1]).expanduser()
+            idx += 2
+        else:
+            error(f"unknown bench option: {arg}")
+    preset = _require_preset(data, name)
+    row, _paths, lines = core.run_benchmark(preset, out_dir=out_dir, csv_out=csv_out)
+    for line in lines:
+        print(line)
+    if row.get("status") != "pass":
+        sys.exit(1)
+
+
+def cmd_stress(data: dict, name: str) -> None:
+    preset = _require_preset(data, name)
+    ok, lines = core.context_stress_report(preset)
+    for line in lines:
+        print(line)
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_export_presets(data: dict, args: list[str]) -> None:
+    if "--out" not in args:
+        error("usage: llamawrap-cli export-presets --out <file> [--portable] [preset-name...]")
+    out_idx = args.index("--out")
+    if out_idx + 1 >= len(args):
+        error("usage: --out requires a file")
+    out_file = Path(args[out_idx + 1]).expanduser()
+    portable = "--portable" in args
+    names = [
+        arg for idx, arg in enumerate(args[1:])
+        if arg not in {"--out", "--portable"} and idx + 1 != out_idx + 1
+    ]
+    try:
+        warnings = core.export_presets(data, out_file, names=names, portable=portable)
+    except ValueError as exc:
+        error(str(exc))
+    print(f"exported {len(names) if names else len(data.get('presets', []))} preset(s) to {out_file}")
+    for warning in warnings:
+        print(f"warning: {warning}")
+
+
+def cmd_import_presets(data: dict, path: Path, args: list[str]) -> None:
+    if len(args) < 2:
+        error("usage: llamawrap-cli import-presets <file> [--force]")
+    in_file = Path(args[1]).expanduser()
+    force = "--force" in args
+    unknown = [arg for arg in args[2:] if arg != "--force"]
+    if unknown:
+        error(f"unknown import-presets option: {unknown[0]}")
+    try:
+        imported, skipped = core.import_presets(data, in_file, force=force)
+    except Exception as exc:
+        error(str(exc))
+    save_history(path, data)
+    print(f"imported {imported} preset(s) from {in_file}")
+    if skipped:
+        print(f"skipped existing preset(s): {', '.join(skipped)}")
+
+
 # ───────────────────────────────────────
 #  Main
 # ───────────────────────────────────────
@@ -1083,6 +946,12 @@ HELP_TEXT = """Commands:
   list                        List all presets.
   create  <name> <model>      Create a preset from a model path.
   import  <name> <command>    Import a pasted launch command as a preset.
+  doctor  <name>              Check executable, paths, port, and API endpoints.
+  probe   <name>              Send one OpenAI-compatible chat request.
+  bench   <name>              Run one short benchmark request and save results.
+  stress  <name>              Run the same context stress suite as the GUI.
+  export-presets --out <file> Export presets to a portable JSON bundle.
+  import-presets <file>       Import presets from an exported JSON bundle.
   show    <name>              Show preset details, flags, and values.
   set     <name> <flag> <val> Set or add a flag value. Creates the flag if missing, enables it.
   enable  <name> <flag>       Enable (tick) a flag. Creates as toggle if missing.
@@ -1099,6 +968,12 @@ HELP_DETAIL = {
     "list": "list\n    List all saved presets with their model file names.",
     "create": "create <preset-name> <model-path> [options]\n    Create a new preset. Creates history.json if it does not exist.\n\n    Options:\n      --executable <path-or-command>   Server executable (default: llama-server)\n      --inferer <name>                 Inferer label (default: llama.cpp)\n      --mmproj <path>                  MMProj model path and enabled --mmproj flag\n      --draft-model <path>             Draft/speculative model path\n      --extra-args <args>              Extra server args, quoted as one value\n      --set <flag> <value>             Set and enable a valued flag; repeatable\n      --toggle <flag>                  Enable a toggle flag; repeatable\n      --force                          Replace an existing preset with same name\n\n    Example:\n      llamawrap-cli create \"My Model\" /models/model.gguf --set -ngl all --set -c 32768 --set --port 8080",
     "import": "import <preset-name> <command-or-args...> [--force]\n    Import a llama-server command or launch args as a preset. Recognized\n    flags are stored as normal preset fields; unknown flags are preserved.\n\n    Examples:\n      llamawrap-cli import \"My Model\" llama-server -m /models/model.gguf -ngl all -c 32768\n      llamawrap-cli import \"Args Only\" -m /models/model.gguf --port 8080",
+    "doctor": "doctor <preset-name>\n    Check the preset executable, model paths, configured host/port,\n    /health, /v1/models, and /v1/chat/completions.",
+    "probe": "probe <preset-name>\n    Send one small OpenAI-compatible /v1/chat/completions request to the\n    configured running endpoint and print pass/fail details.",
+    "bench": "bench <preset-name> [--csv] [--out-dir <dir>]\n    Send one short controlled prompt to the configured running endpoint,\n    report latency and token speed when available, and save JSON results\n    under .llama-wrap/benchmarks by default. --csv saves a CSV copy too.",
+    "stress": "stress <preset-name>\n    Run the same percentage-based context stress suite as the GUI Stress\n    button: runtime context detection, fill/decode stages, sustained synthetic\n    coding-agent turns, boundary probes, error classification, and a practical\n    working-limit summary.",
+    "export-presets": "export-presets --out <file> [--portable] [preset-name...]\n    Export all presets, or selected preset names, to a JSON bundle.\n    Absolute paths are preserved and reported as portability warnings.",
+    "import-presets": "import-presets <file> [--force]\n    Import presets from an export-presets JSON bundle. Existing preset names\n    are skipped unless --force is supplied. This does not change the older\n    import <name> <command> command.",
     "show": "show <preset-name>\n    Display the preset's inferer, executable, model paths, all flags,\n    their enabled/disabled status, and current values.",
     "set": "set <preset-name> <flag> <value>\n    Set a flag's value and enable it. If the flag doesn't exist in the\n    preset it is added automatically. Example:\n      llamawrap-cli set \"My Model\" --port 8080",
     "enable": "enable <preset-name> <flag>\n    Enable (check/tick) a flag so it is included when building the\n    server command. Creates the flag as a toggle (no value) if missing.\n    Example:\n      llamawrap-cli enable \"My Model\" --jinja",
@@ -1351,7 +1226,8 @@ def main() -> None:
         return
     if args[0] not in (
         "list", "create", "import", "show", "set", "enable", "disable",
-        "rmflag", "rename", "delete", "run", "help",
+        "rmflag", "rename", "delete", "run", "doctor", "probe", "bench",
+        "stress", "export-presets", "import-presets", "help",
     ):
         print(f"unknown command: {args[0]}", file=sys.stderr)
         cmd_help([])
@@ -1362,7 +1238,7 @@ def main() -> None:
         cmd_help(args)
         return
 
-    data = load_or_init_history(history_path) if cmd in {"create", "import"} else load_history(history_path)
+    data = load_or_init_history(history_path) if cmd in {"create", "import", "import-presets"} else load_history(history_path)
 
     if cmd == "list":
         cmd_list(data)
@@ -1418,6 +1294,30 @@ def main() -> None:
         if not name_args:
             error("usage: llamawrap-cli run <preset-name> [--auto]")
         cmd_run(data, name_args[0], auto=auto, history_path=history_path)
+
+    elif cmd == "doctor":
+        if len(args) < 2:
+            error("usage: llamawrap-cli doctor <preset-name>")
+        cmd_doctor(data, args[1])
+
+    elif cmd == "probe":
+        if len(args) < 2:
+            error("usage: llamawrap-cli probe <preset-name>")
+        cmd_probe(data, args[1])
+
+    elif cmd == "bench":
+        cmd_bench(data, args)
+
+    elif cmd == "stress":
+        if len(args) < 2:
+            error("usage: llamawrap-cli stress <preset-name>")
+        cmd_stress(data, args[1])
+
+    elif cmd == "export-presets":
+        cmd_export_presets(data, args)
+
+    elif cmd == "import-presets":
+        cmd_import_presets(data, history_path, args)
 
     else:
         print(f"unknown command: {cmd}", file=sys.stderr)

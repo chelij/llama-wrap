@@ -1,8 +1,8 @@
 # llama-wrap
 
-`llama-wrap` is a lightweight launcher for `llama-server`-compatible GGUF model servers.
+`llama-wrap` is a lightweight launcher and local-ops helper for `llama-server`-compatible GGUF model servers.
 
-It helps you build, import, save, and run launch commands without retyping long flag lists. Use the desktop GUI when you want a visual launcher, or the interactive CLI when you are working from a terminal or a headless machine.
+It helps you build, import, save, run, diagnose, probe, benchmark, and stress-test launch commands without retyping long flag lists. Use the desktop GUI when you want a visual launcher, or the CLI when you are working from a terminal or a headless machine.
 
 It is not a chat UI, model downloader, or model manager.
 
@@ -89,14 +89,19 @@ python llamawrap.py run "My Model"
 ## Features
 
 - **GUI and CLI**: use a desktop launcher or terminal browser from the same project.
+- **Shared ops core**: GUI and CLI use the same command building, preset parsing, endpoint checks, benchmark formatting, and stress-test logic.
 - **Presets**: save, load, rename, delete, create, and import launch configurations.
 - **Command import**: paste an existing `llama-server` command and turn it into a preset.
 - **Model selectors**: browse for model, MMProj, and draft `.gguf` files.
 - **Flag editing**: edit common flags, add custom flags, or pass advanced extra args.
+- **Diagnostics**: run Doctor, Probe, Bench, and Stress from the GUI or CLI.
+- **Benchmarks**: save local JSON results, with optional CSV output from the CLI.
+- **Context stress**: test large-context behavior with fill/decode stages, sustained synthetic coding-agent turns, and boundary probes.
 - **Auto-restart**: restart a server if it crashes.
+- **Stop logging**: the GUI log reports when a stop request is sent and when the server has stopped.
 - **Live output**: view server logs in the GUI or terminal.
 - **Session stats**: track average TTFT, tok/s, and restart count per preset.
-- **VRAM estimate**: estimate memory use from model size, GGUF metadata, context, KV cache, GPU layers, draft model, and MMProj.
+- **VRAM estimate and calibration**: estimate memory use from model size, GGUF metadata, context, KV cache, GPU layers, draft model, and MMProj, then calibrate matching presets from runtime logs/GPU readings after launch.
 
 ## Common Tasks
 
@@ -149,6 +154,32 @@ python llamawrap.py disable "My Model" -ngl
 ```bash
 python llamawrap.py run "My Model"
 python llamawrap.py run "My Model" --auto
+```
+
+### Run Diagnostics
+
+These commands expect the configured endpoint to be running, except for the local executable/path parts of Doctor.
+
+```bash
+python llamawrap.py doctor "My Model"
+python llamawrap.py probe "My Model"
+python llamawrap.py bench "My Model"
+python llamawrap.py stress "My Model"
+```
+
+Bench results are saved under `.llama-wrap/benchmarks` by default. For CSV output:
+
+```bash
+python llamawrap.py bench "My Model" --csv
+```
+
+### Export or Import Preset Bundles
+
+Preset bundle import/export is CLI-only. It is separate from the older `import <name> <command>` command that turns a launch command into one preset.
+
+```bash
+python llamawrap.py export-presets --out presets.json --portable
+python llamawrap.py import-presets presets.json
 ```
 
 ## Interactive CLI
@@ -207,6 +238,12 @@ You can use either `python llamawrap.py <command>` or `llamawrap-cli <command>`.
 llamawrap-cli list
 llamawrap-cli create "My Model" /models/model.gguf --set -ngl all --set -c 32768
 llamawrap-cli import "My Model" llama-server -m /models/model.gguf -ngl all -c 32768
+llamawrap-cli doctor "My Model"
+llamawrap-cli probe "My Model"
+llamawrap-cli bench "My Model" --csv
+llamawrap-cli stress "My Model"
+llamawrap-cli export-presets --out presets.json --portable
+llamawrap-cli import-presets presets.json
 llamawrap-cli show "My Model"
 llamawrap-cli run "My Model" --auto
 llamawrap-cli set "My Model" --port 8080
@@ -234,6 +271,8 @@ Each preset stores:
 - session stats from the last run
 
 Recent run commands are also saved, capped to the latest 100 entries.
+
+Benchmark outputs are stored under `.llama-wrap/benchmarks` by default. That local data folder is ignored by git and is safe to delete when you no longer need the reports.
 
 ## Importing Existing Commands
 
@@ -270,7 +309,7 @@ http://127.0.0.1:<port>/metrics
 
 ## VRAM Estimate
 
-The VRAM display is an estimate. It uses:
+The VRAM display starts as a pre-launch estimate. It uses:
 
 - model file size
 - parsed GGUF metadata
@@ -282,6 +321,21 @@ The VRAM display is an estimate. It uses:
 - runtime overhead
 
 Values are shown in binary units such as MiB and GiB.
+
+After a model is launched, `llama-wrap` watches `llama-server` allocation log lines and GPU process/total VRAM readings. When the observed runtime value matches the current preset command and model file signature, a calibration record is stored in `history.json` and the GUI shows the calibrated value on future matching loads. Existing preset fields remain backward compatible.
+
+Calibration is intentionally conservative: implausibly tiny process readings are ignored unless allocation logs are available.
+
+## Diagnostics
+
+The GUI Diagnostics row runs these actions in the background and streams readable output into the existing log panel:
+
+- **Doctor**: checks executable/path setup, configured host/port, port availability, `/health`, `/v1/models`, and `/v1/chat/completions`.
+- **Probe**: sends one small OpenAI-compatible chat completion request.
+- **Bench**: sends one controlled prompt, reports latency/token speed when available, and saves a JSON result locally.
+- **Stress**: detects effective runtime context, runs staged fill/decode requests, sustained synthetic coding-agent turns, boundary probes, and prints a practical working-limit summary.
+
+The CLI exposes the same diagnostics through `doctor`, `probe`, `bench`, and `stress`.
 
 ## Requirements
 
