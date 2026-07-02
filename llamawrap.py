@@ -38,8 +38,22 @@ TK_TCL_ERROR = tk.TclError if tk is not None else RuntimeError
 APP_TITLE = "llama-wrap"
 DEFAULT_SERVER_PORT = 8080
 APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
-HISTORY_FILE = Path(os.environ["LLAMA_WRAP_HISTORY"]).expanduser() if os.environ.get("LLAMA_WRAP_HISTORY") else APP_DIR / "history.json"
 GB = 1024**3
+
+
+def _default_history_file() -> Path:
+    """Env override, then an existing history next to the app (portable installs),
+    then the per-user data dir — writable even when the app dir is read-only."""
+    env_path = os.environ.get("LLAMA_WRAP_HISTORY")
+    if env_path:
+        return Path(env_path).expanduser()
+    local = APP_DIR / "history.json"
+    if local.exists():
+        return local
+    return core.platform_data_dir() / "history.json"
+
+
+HISTORY_FILE = _default_history_file()
 
 # Known llama-server flags for the "Add flag" suggestion dropdown.
 # These are NOT a hardcoded UI — they only appear as autocomplete hints
@@ -158,7 +172,7 @@ class HistoryStore:
             "runs": self.runs[-100:],
             "settings": self.settings,
         }
-        self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        core.atomic_write_text(self.path, json.dumps(data, indent=2))
 
     def set_setting(self, key: str, value: Any) -> None:
         self.settings[key] = value
@@ -539,6 +553,8 @@ class Tooltip:
 
 
 class LauncherApp:
+    _AUTO_RESTART_LIMIT = 3
+
     def __init__(self) -> None:
         self.history = HistoryStore(HISTORY_FILE)
         self.gpu = GPUMonitor()
@@ -574,6 +590,8 @@ class LauncherApp:
         self._session_stats_var: tk.StringVar | None = None
         self._auto_restart_count: int = 0
         self.diagnostics_busy = False
+        self._diag_cancel = threading.Event()
+        self._log_file: Any = None
         self._vram_command: list[str] = []
         self._vram_command_hash: str = ""
         self._vram_baseline_total_used: int | None = None
@@ -583,11 +601,17 @@ class LauncherApp:
         self.loading_preset = False
         self._server_ready: bool = False
         self._health_check_timer: str | None = None
+        self._visible_presets: list[dict[str, Any]] = []
+        self.preset_search_var: tk.StringVar | None = None
+        self.preset_search_entry: tk.Entry | None = None
+        self._busy_pulse_job: str | None = None
+        self._busy_pulse_phase: int = 0
+        self._busy_pulse_base: str = ""
 
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("1400x720")
         self.root.minsize(800, 600)
+        self.root.geometry(self._initial_geometry())
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.configure_style()
         self.configure_text_shortcuts()
@@ -795,6 +819,17 @@ class LauncherApp:
                 self.root.bind_class(class_name, f"<Control-{key}>", lambda event, ve=virtual_event: (event.widget.event_generate(ve), "break")[1])
 
         self.root.bind("<Control-s>", lambda _event: self.save_current_preset() or "break")
+        self.root.bind("<Control-Return>", lambda _event: self.launch() or "break")
+        self.root.bind("<Control-f>", self.focus_preset_search)
+        self.root.bind("<Control-F>", self.focus_preset_search)
+        self.root.bind("<Escape>", self._handle_escape_stop)
+
+    def _handle_escape_stop(self, _event: tk.Event) -> str | None:
+        # Don't hijack Escape while the user is typing in a text field.
+        if isinstance(self.root.focus_get(), tk.Entry):
+            return None
+        self.stop_process()
+        return "break"
 
     def build_ui(self) -> None:
         top_bar = tk.Frame(self.root, bg="#080b12", height=54)
@@ -810,7 +845,7 @@ class LauncherApp:
 
         left = tk.Frame(body, bg=self.colors["panel"], highlightbackground=self.colors["border"], highlightthickness=1)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-        left.rowconfigure(2, weight=1)
+        left.rowconfigure(3, weight=1)
         left.columnconfigure(0, weight=1)
 
         preset_header = tk.Frame(left, bg=self.colors["panel"])
@@ -842,8 +877,30 @@ class LauncherApp:
             row=1, column=2, sticky="nsew", pady=(4, 0)
         )
 
+        preset_search_frame = tk.Frame(left, bg=self.colors["panel"])
+        preset_search_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+        preset_search_frame.columnconfigure(0, weight=1)
+        self.preset_search_var = tk.StringVar(value="")
+        self.preset_search_entry = tk.Entry(
+            preset_search_frame,
+            textvariable=self.preset_search_var,
+            bg=self.colors["field"],
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=self.colors["border"],
+            highlightcolor=self.colors["accent"],
+            font=("TkDefaultFont", 10),
+        )
+        self.preset_search_entry.grid(row=0, column=0, sticky="ew", ipady=4, padx=(0, 0))
+        self._set_placeholder(self.preset_search_entry, "Filter presets…  (Ctrl+F)")
+        self.preset_search_var.trace_add("write", lambda *_args: self.render_presets())
+        self.preset_search_entry.bind("<Escape>", self._clear_preset_search)
+        Tooltip(self.preset_search_entry, "Filter presets\n\nType to narrow the list by preset name or model file name. Esc clears it.")
+
         preset_list_frame = tk.Frame(left, bg=self.colors["panel"])
-        preset_list_frame.grid(row=2, column=0, sticky="nsew", padx=10, pady=(0, 14))
+        preset_list_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(0, 14))
         preset_list_frame.rowconfigure(0, weight=1)
         preset_list_frame.columnconfigure(0, weight=1)
         preset_xscroll = ttk.Scrollbar(preset_list_frame, orient="horizontal")
@@ -988,10 +1045,10 @@ class LauncherApp:
             button_bar.columnconfigure(col, weight=1, uniform="control_buttons")
         launch_button = self.make_button(button_bar, "Launch", self.launch, width=72, bg=self.colors["good"], hover=self.colors["good_hover"])
         launch_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        Tooltip(launch_button, "Launch\n\nStart the selected inferer with the current settings.")
+        Tooltip(launch_button, "Launch (Ctrl+Enter)\n\nStart the selected inferer with the current settings.")
         stop_button = self.make_button(button_bar, "Stop", self.stop_process, width=72, bg=self.colors["danger"], hover=self.colors["danger_hover"])
         stop_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
-        Tooltip(stop_button, "Stop\n\nStop the running inferer process.")
+        Tooltip(stop_button, "Stop (Esc)\n\nStop the running inferer process.")
         clear_button = self.make_button(button_bar, "Clear", self.clear_logs, width=72, bg=self.colors["panel_soft"])
         clear_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
         Tooltip(clear_button, "Clear output\n\nClear the output log.")
@@ -1048,7 +1105,7 @@ class LauncherApp:
         )
         diagnostics_buttons = tk.Frame(diagnostics_panel, bg=self.colors["panel"])
         diagnostics_buttons.grid(row=0, column=1, sticky="ew")
-        for col in range(4):
+        for col in range(5):
             diagnostics_buttons.columnconfigure(col, weight=1, uniform="diagnostics_buttons")
         doctor_button = self.make_button(diagnostics_buttons, "Doctor", self.run_diagnostics_doctor, width=78, bg=self.colors["panel_soft"])
         doctor_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -1058,10 +1115,14 @@ class LauncherApp:
         Tooltip(probe_button, "Probe\n\nSend one small chat completion request to the configured endpoint.")
         bench_button = self.make_button(diagnostics_buttons, "Bench", self.run_diagnostics_bench, width=78, bg=self.colors["panel_soft"])
         bench_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
-        Tooltip(bench_button, "Bench\n\nRun one short benchmark request and save JSON results locally.")
+        Tooltip(bench_button, "Bench\n\nRun a warmup plus several streamed iterations and save median performance results locally.")
         stress_button = self.make_button(diagnostics_buttons, "Stress", self.run_diagnostics_stress, width=78, bg=self.colors["warn"])
-        stress_button.grid(row=0, column=3, sticky="ew")
+        stress_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
         Tooltip(stress_button, "Stress\n\nSend a large prompt to fill most of the configured context window.")
+        self.diag_cancel_button = self.make_button(diagnostics_buttons, "Cancel", self.cancel_diagnostics, width=78, bg=self.colors["panel_soft"])
+        self.diag_cancel_button.grid(row=0, column=4, sticky="ew")
+        self.diag_cancel_button.configure(state="disabled")
+        Tooltip(self.diag_cancel_button, "Cancel\n\nStop the running diagnostics task after the current request finishes.")
 
         output_panel = self.make_panel(right, padx=14, pady=12)
         output_panel.grid(row=4, column=0, sticky="nsew")
@@ -1114,12 +1175,20 @@ class LauncherApp:
         )
         self.status_label.grid(row=0, column=1, sticky="w", padx=(10, 20))
         self.tokps_var = tk.StringVar(value="")
-        tk.Label(status_panel, textvariable=self.tokps_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=0, column=2, sticky="w", padx=(0, 12)
-        )
+        tokps_label = tk.Label(status_panel, textvariable=self.tokps_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold"))
+        tokps_label.grid(row=0, column=2, sticky="w", padx=(0, 12))
+        Tooltip(tokps_label, "Last request\n\nGeneration speed of the most recent completion,\nparsed from the server log.")
         self._session_stats_var = tk.StringVar(value="")
-        tk.Label(status_panel, textvariable=self._session_stats_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
-            row=0, column=3, sticky="w", padx=(0, 16)
+        session_stats_label = tk.Label(status_panel, textvariable=self._session_stats_var, bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold"))
+        session_stats_label.grid(row=0, column=3, sticky="w", padx=(0, 16))
+        Tooltip(
+            session_stats_label,
+            "Session averages\n\n"
+            "TTFT: average time to first token (prompt processing)\n"
+            "across all requests since this server was launched.\n"
+            "gen: average generation speed across those requests.\n\n"
+            "When a preset is loaded but not running, this shows\n"
+            "the averages saved from its previous session.",
         )
         tk.Label(status_panel, text="VRAM", bg=self.colors["panel"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=0, column=4, sticky="e", padx=(0, 10)
@@ -1146,6 +1215,51 @@ class LauncherApp:
             justify="left",
             font=("DejaVu Sans Mono", 9),
         ).grid(row=2, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+
+    def _set_placeholder(self, entry: tk.Entry, text: str) -> None:
+        """Show greyed-out placeholder text in an empty Entry bound to a StringVar.
+
+        The placeholder lives in the same StringVar as real input (simplest way to
+        keep a single source of truth), so callers that read the var must treat a
+        value equal to the placeholder as "empty" — see _is_placeholder_text.
+        """
+        entry._placeholder_text = text  # type: ignore[attr-defined]
+
+        def _show_placeholder() -> None:
+            entry.delete(0, "end")
+            entry.insert(0, text)
+            entry.configure(fg=self.colors["muted"])
+
+        def _on_focus_in(_event: tk.Event) -> None:
+            if entry.get() == text and str(entry.cget("fg")) == self.colors["muted"]:
+                entry.delete(0, "end")
+                entry.configure(fg=self.colors["text"])
+
+        def _on_focus_out(_event: tk.Event) -> None:
+            if not entry.get():
+                _show_placeholder()
+
+        entry.bind("<FocusIn>", _on_focus_in, add="+")
+        entry.bind("<FocusOut>", _on_focus_out, add="+")
+        _show_placeholder()
+
+    def _is_placeholder_text(self, entry: tk.Entry | None, value: str) -> bool:
+        return bool(entry is not None and value == getattr(entry, "_placeholder_text", None))
+
+    def _clear_preset_search(self, _event: tk.Event | None = None) -> str:
+        if self.preset_search_var is not None:
+            self.preset_search_var.set("")
+        if self.preset_search_entry is not None:
+            self.preset_search_entry.master.focus_set()
+        return "break"
+
+    def focus_preset_search(self, _event: tk.Event | None = None) -> str:
+        if self.preset_search_entry is not None:
+            self.preset_search_entry.focus_set()
+            if self._is_placeholder_text(self.preset_search_entry, self.preset_search_entry.get()):
+                self.preset_search_entry.icursor(0)
+                self.preset_search_entry.selection_range(0, "end")
+        return "break"
 
     def make_panel(self, parent: tk.Widget, padx: int = 12, pady: int = 12) -> tk.Frame:
         return tk.Frame(parent, bg=self.colors["panel"], highlightbackground=self.colors["border"], highlightthickness=1, padx=padx, pady=pady)
@@ -1545,13 +1659,34 @@ class LauncherApp:
         self.recalculate_vram()
 
     def render_presets(self) -> None:
+        if getattr(self, "preset_list", None) is None:
+            return  # widgets not fully built yet (e.g. placeholder setup firing the search trace)
+        query = ""
+        if self.preset_search_var is not None:
+            raw = self.preset_search_var.get()
+            if not self._is_placeholder_text(self.preset_search_entry, raw):
+                query = raw.strip().lower()
+
+        if query:
+            visible = [
+                preset
+                for preset in self.history.presets
+                if query in preset.get("preset_name", "").lower()
+                or query in Path(preset.get("model_path", "") or "").name.lower()
+            ]
+        else:
+            visible = list(self.history.presets)
+        self._visible_presets = visible
+
         self.preset_list.delete(0, "end")
-        for preset in self.history.presets:
+        for preset in visible:
             name = preset.get("preset_name", "Unnamed")
             suffix = " *" if self.selected_preset == name and self.dirty else ""
             self.preset_list.insert("end", f"{name}{suffix}")
+        if not visible and query:
+            self.preset_list.insert("end", "(no matching presets)")
         if self.selected_preset:
-            for idx, preset in enumerate(self.history.presets):
+            for idx, preset in enumerate(visible):
                 if preset.get("preset_name") == self.selected_preset:
                     self.preset_list.selection_set(idx)
                     self.preset_list.activate(idx)
@@ -1562,16 +1697,16 @@ class LauncherApp:
 
     def update_preset_tooltip(self, event: tk.Event) -> None:
         idx = self.preset_list.nearest(event.y)
-        if idx < 0 or idx >= len(self.history.presets):
+        if idx < 0 or idx >= len(self._visible_presets):
             self.preset_tooltip.text = ""
             return
-        self.preset_tooltip.text = self.history.presets[idx].get("preset_name", "Unnamed")
+        self.preset_tooltip.text = self._visible_presets[idx].get("preset_name", "Unnamed")
 
     def load_selected_preset(self, _event: tk.Event | None = None) -> None:
         selection = self.preset_list.curselection()
-        if not selection:
+        if not selection or selection[0] >= len(self._visible_presets):
             return
-        preset = self.history.presets[selection[0]]
+        preset = self._visible_presets[selection[0]]
         self.load_preset(preset)
 
     def new_preset(self) -> None:
@@ -1860,6 +1995,13 @@ class LauncherApp:
         if not self.selected_preset:
             messagebox.showwarning("No preset selected", "Select a preset first.")
             return
+        if not messagebox.askyesno(
+            "Delete preset",
+            f"Delete preset '{self.selected_preset}'? This cannot be undone.",
+            icon="warning",
+            parent=self.root,
+        ):
+            return
         self.history.delete_preset(self.selected_preset)
         self.selected_preset = None
         self.render_presets()
@@ -1913,12 +2055,12 @@ class LauncherApp:
         if stats:
             parts = []
             if "avg_ttft_ms" in stats:
-                parts.append(f"{stats['avg_ttft_ms']}ms TTFT")
+                parts.append(f"TTFT {stats['avg_ttft_ms']} ms")
             if "avg_tok_s" in stats:
-                parts.append(f"{stats['avg_tok_s']} tok/s")
+                parts.append(f"gen {stats['avg_tok_s']} tok/s")
             if stats.get("auto_restarts", 0):
                 parts.append(f"{stats['auto_restarts']} restarts")
-            self._session_stats_var.set("Last session: " + " | ".join(parts))
+            self._session_stats_var.set("last session: " + " · ".join(parts))
         else:
             self._session_stats_var.set("")
         if hasattr(self, "right_canvas"):
@@ -2390,14 +2532,19 @@ class LauncherApp:
             return
         preset = self.current_preset_payload()
         self.diagnostics_busy = True
+        self._diag_cancel.clear()
+        if hasattr(self, "diag_cancel_button"):
+            self.diag_cancel_button.configure(state="normal")
         self.append_log("normal", f"── {label} ──")
+
+        def on_line(line: str) -> None:
+            # Called from the worker thread; append_log queues cross-thread lines.
+            self.append_log("error" if line.startswith("[FAIL]") else "normal", line)
 
         def run() -> None:
             try:
-                ok, lines = worker(preset)
-                for line in lines:
-                    self.append_log("error" if line.startswith("[FAIL]") else "normal", line)
-                if not ok:
+                ok = worker(preset, on_line, self._diag_cancel)
+                if not ok and not self._diag_cancel.is_set():
                     self.append_log("error", f"{label} failed.")
             except Exception as exc:
                 self.append_log("error", f"{label} failed: {exc}")
@@ -2408,22 +2555,32 @@ class LauncherApp:
 
     def _finish_diagnostics_task(self) -> None:
         self.diagnostics_busy = False
+        if hasattr(self, "diag_cancel_button"):
+            self.diag_cancel_button.configure(state="disabled")
+
+    def cancel_diagnostics(self) -> None:
+        if self.diagnostics_busy and not self._diag_cancel.is_set():
+            self._diag_cancel.set()
+            self.append_log("warn", "Cancelling diagnostics after the current request...")
 
     def run_diagnostics_doctor(self) -> None:
-        self._run_diagnostics_task("Doctor", lambda preset: core.doctor_report(preset))
+        self._run_diagnostics_task("Doctor", lambda preset, on_line, _cancel: core.doctor_report(preset, on_line=on_line)[0])
 
     def run_diagnostics_probe(self) -> None:
-        self._run_diagnostics_task("Probe", lambda preset: core.probe_report(preset))
+        self._run_diagnostics_task("Probe", lambda preset, on_line, _cancel: core.probe_report(preset, on_line=on_line)[0])
 
     def run_diagnostics_bench(self) -> None:
-        def worker(preset: dict[str, Any]) -> tuple[bool, list[str]]:
-            row, _paths, lines = core.run_benchmark(preset)
-            return row.get("status") == "pass", lines
+        def worker(preset: dict[str, Any], on_line: Any, cancel: Any) -> bool:
+            row, _paths, _lines = core.run_benchmark(preset, on_line=on_line, cancel=cancel)
+            return row.get("status") == "pass"
 
         self._run_diagnostics_task("Bench", worker)
 
     def run_diagnostics_stress(self) -> None:
-        self._run_diagnostics_task("Stress", lambda preset: core.context_stress_report(preset))
+        self._run_diagnostics_task(
+            "Stress",
+            lambda preset, on_line, cancel: core.context_stress_report(preset, on_line=on_line, cancel=cancel)[0],
+        )
 
     def update_vram_ui(self) -> None:
         process_running = self.process is not None and self.process.poll() is None
@@ -2608,6 +2765,8 @@ class LauncherApp:
             return
         self.intentional_stop = False
         self.clear_logs()
+        if not self.ensure_port_available(self.get_int_flag("--port", DEFAULT_SERVER_PORT), executable, interactive=True):
+            return
         self.start_process(command, add_separator=False)
 
     def start_process(self, command: list[str], add_separator: bool = False) -> None:
@@ -2616,9 +2775,12 @@ class LauncherApp:
         self._stop_logged = False
         self.reset_session_stats()
         self.reset_vram_calibration_session(command)
-        self.kill_existing_on_port(self.get_int_flag("--port", DEFAULT_SERVER_PORT))
+        if not self.ensure_port_available(self.get_int_flag("--port", DEFAULT_SERVER_PORT), command[0], interactive=False):
+            self.set_status("Error")
+            return
         if add_separator:
             self.append_log("warn", "Auto-restarting inferer...")
+        self._open_session_log()
         self.append_log("normal", f"$ {shlex.join(command)}")
         self.set_status("Launching")
         try:
@@ -2629,6 +2791,7 @@ class LauncherApp:
                 text=True,
                 bufsize=1,
                 start_new_session=(os.name != "nt"),
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
             self.history.add_run(self.model_var.get().strip(), command)
             threading.Thread(target=self.stream_pipe, args=(self.process.stdout,), daemon=True).start()
@@ -2649,23 +2812,49 @@ class LauncherApp:
             total_used = None
         self._vram_baseline_total_used = total_used
 
-    def kill_existing_on_port(self, port: int) -> None:
-        if os.name == "nt" or not shutil.which("lsof"):
-            return
+    def ensure_port_available(self, port: int, executable: str, *, interactive: bool) -> bool:
+        """Free the launch port without ever killing an unrelated process silently.
+
+        Our own previous server (or a process matching the inferer executable name)
+        is stopped automatically; anything else prompts the user (interactive) or
+        aborts with an explanation (auto-restart)."""
+        occupants = core.processes_on_port(port)
+        if not occupants:
+            return True
+        own_pid = self.process.pid if self.process and self.process.poll() is None else None
         try:
-            output = subprocess.check_output(["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], text=True, stderr=subprocess.DEVNULL, timeout=3)
-        except Exception:
-            return
-        for pid_text in output.splitlines():
-            try:
-                pid = int(pid_text)
-            except ValueError:
-                continue
-            self.append_log("warn", f"Stopping process on port {port}: pid {pid}")
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                continue
+            exe_name = Path(shlex.split(executable)[0]).name if executable else ""
+        except ValueError:
+            exe_name = ""
+        to_stop: list[tuple[int, str]] = []
+        for pid, name in occupants:
+            if pid == own_pid or (exe_name and name != "unknown" and name.startswith(exe_name)):
+                to_stop.append((pid, name))
+            elif interactive:
+                stop = messagebox.askyesno(
+                    "Port in use",
+                    f"Port {port} is in use by '{name}' (pid {pid}), which does not look like your inferer.\n\n"
+                    "Stop that process and continue launching?",
+                    parent=self.root,
+                )
+                if not stop:
+                    self.append_log("warn", f"Launch cancelled: port {port} is in use by {name} (pid {pid}).")
+                    return False
+                to_stop.append((pid, name))
+            else:
+                self.append_log("error", f"Port {port} is in use by '{name}' (pid {pid}); not stopping an unrelated process automatically.")
+                return False
+        for pid, name in to_stop:
+            self.append_log("warn", f"Stopping process on port {port}: {name} (pid {pid})")
+            core.terminate_pid(pid)
+        deadline = time.time() + 3
+        while time.time() < deadline and core.processes_on_port(port):
+            time.sleep(0.2)
+        for pid, name in core.processes_on_port(port):
+            self.append_log("warn", f"Process {name} (pid {pid}) did not exit; force stopping.")
+            core.terminate_pid(pid, force=True)
+            time.sleep(0.3)
+        return True
 
     def stream_pipe(self, pipe: Any) -> None:
         if pipe is None:
@@ -2673,19 +2862,51 @@ class LauncherApp:
         for line in iter(pipe.readline, ""):
             self.append_log(self.classify_log(line), line.rstrip())
 
+    def _signal_stop(self, process: subprocess.Popen[str]) -> None:
+        """Ask the server (and its process group) to exit gracefully."""
+        try:
+            if os.name != "nt":
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def _kill_tree(self, process: subprocess.Popen[str]) -> None:
+        """Force-kill the server and any children it spawned."""
+        try:
+            if os.name != "nt":
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            else:
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                )
+        except Exception:
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    def _escalate_stop(self, pid: int) -> None:
+        process = self.process
+        if not process or process.pid != pid or process.poll() is not None:
+            return
+        self.append_log("warn", "Inferer did not exit within 5s; force killing.")
+        self._kill_tree(process)
+
     def stop_process(self) -> None:
         self.intentional_stop = True
         self._stop_health_check()
         if self.process and self.process.poll() is None:
             self.append_log("warn", "Stopping inferer...")
-            try:
-                if os.name != "nt":
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                else:
-                    self.process.terminate()
-            except Exception:
-                self.process.terminate()
+            self._signal_stop(self.process)
             self.set_status("Stopping")
+            pid = self.process.pid
+            self.root.after(5000, lambda: self._escalate_stop(pid))
         else:
             self.set_status("Stopped")
             if not self._stop_logged:
@@ -2708,13 +2929,25 @@ class LauncherApp:
                 self.set_status("Crashed")
                 self.append_log("error", f"inferer exited with code {code}")
                 if hasattr(self, "auto_restart_var") and self.auto_restart_var.get():
-                    try:
-                        command = self.build_command()
-                    except Exception as exc:
-                        self.append_log("error", f"Auto-restart skipped: {exc}")
+                    if self._auto_restart_count >= self._AUTO_RESTART_LIMIT:
+                        self.append_log(
+                            "error",
+                            f"Auto-restart limit reached ({self._AUTO_RESTART_LIMIT} crashes without reaching Ready); "
+                            "not restarting. Fix the configuration and launch manually.",
+                        )
                     else:
-                        self._auto_restart_count += 1
-                        self.root.after(800, lambda cmd=command: self.start_process(cmd, add_separator=True))
+                        try:
+                            command = self.build_command()
+                        except Exception as exc:
+                            self.append_log("error", f"Auto-restart skipped: {exc}")
+                        else:
+                            delay_ms = 800 * (2 ** self._auto_restart_count)
+                            self._auto_restart_count += 1
+                            self.append_log(
+                                "warn",
+                                f"Auto-restart {self._auto_restart_count}/{self._AUTO_RESTART_LIMIT} in {delay_ms} ms...",
+                            )
+                            self.root.after(delay_ms, lambda cmd=command: self.start_process(cmd, add_separator=True))
             self._save_session_stats_to_preset()
         self.root.after(600, self.refresh_process_state)
 
@@ -2728,6 +2961,10 @@ class LauncherApp:
         # Poll every 2s while server is running, every 30s when idle
         interval = 2000 if process_running else 30000
         self.root.after(interval, self.refresh_gpu_usage)
+
+    # "Running" (not yet "Ready") covers the health-check-polling window between
+    # the process starting and /health succeeding, so it pulses too.
+    _BUSY_STATUSES = ("Launching", "Stopping", "Running")
 
     def set_status(self, status: str) -> None:
         if status == "Running" and self._server_ready:
@@ -2747,7 +2984,51 @@ class LauncherApp:
                 "Error": self.colors["danger"],
                 "Crashed": self.colors["danger"],
             }
-            self.status_label.configure(bg=colors.get(display, self.colors["panel_soft"]))
+            if display in self._BUSY_STATUSES:
+                self._start_busy_pulse(colors[display])
+            else:
+                self._stop_busy_pulse()
+                self.status_label.configure(bg=colors.get(display, self.colors["panel_soft"]))
+
+    def _start_busy_pulse(self, base_color: str) -> None:
+        """Pulse the status badge between base_color and a dimmed shade while busy
+        (between Launch/Stop being clicked and the server settling into a final
+        state), so there's visible activity instead of a static label."""
+        self._busy_pulse_base = base_color
+        if self._busy_pulse_job is None:
+            self._busy_pulse_phase = 0
+            self._busy_pulse_tick()
+
+    def _busy_pulse_tick(self) -> None:
+        if not hasattr(self, "status_label"):
+            self._busy_pulse_job = None
+            return
+        self._busy_pulse_phase = (self._busy_pulse_phase + 1) % 2
+        color = self._busy_pulse_base if self._busy_pulse_phase == 0 else self._dim_hex_color(self._busy_pulse_base)
+        try:
+            self.status_label.configure(bg=color)
+        except tk.TclError:
+            self._busy_pulse_job = None
+            return
+        self._busy_pulse_job = self.root.after(420, self._busy_pulse_tick)
+
+    def _stop_busy_pulse(self) -> None:
+        if self._busy_pulse_job is not None:
+            try:
+                self.root.after_cancel(self._busy_pulse_job)
+            except tk.TclError:
+                pass
+            self._busy_pulse_job = None
+
+    @staticmethod
+    def _dim_hex_color(hex_color: str, factor: float = 0.5) -> str:
+        try:
+            hex_color = hex_color.lstrip("#")
+            r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+            r, g, b = (max(0, min(255, int(c * factor))) for c in (r, g, b))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return hex_color
 
     def _get_server_url(self) -> str:
         """Build the server URL from host and port flags."""
@@ -2790,6 +3071,8 @@ class LauncherApp:
         # Health check passed
         self._server_ready = True
         self._health_check_timer = None
+        # A server that reached Ready is healthy again: reset the crash-loop guard.
+        self._auto_restart_count = 0
         self.set_status("Ready")
         self.maybe_save_vram_calibration()
         self.append_log("normal", f"Server ready at {self._get_server_url()}")
@@ -2907,11 +3190,11 @@ class LauncherApp:
         parts = []
         if self._session_ttft_ms:
             avg_ttft = sum(self._session_ttft_ms) / len(self._session_ttft_ms)
-            parts.append(f"{avg_ttft:.0f}ms TTFT")
+            parts.append(f"TTFT {avg_ttft:.0f} ms")
         if self._session_gen_tokens > 0 and self._session_gen_time_ms > 0:
             avg_tps = (self._session_gen_tokens / self._session_gen_time_ms) * 1000.0
-            parts.append(f"{avg_tps:.2f} tok/s")
-        self._session_stats_var.set("  ".join(parts))
+            parts.append(f"gen {avg_tps:.2f} tok/s")
+        self._session_stats_var.set("session avg: " + " · ".join(parts) if parts else "")
 
     def _save_session_stats_to_preset(self) -> None:
         """Save current session averages to the preset in history.json."""
@@ -2937,6 +3220,45 @@ class LauncherApp:
         }
         self.history.upsert_preset(preset)
 
+    _SESSION_LOG_KEEP = 10
+
+    def _open_session_log(self) -> None:
+        """Start a new on-disk log for this server session so crash output survives
+        the GUI closing. Keeps the last few sessions and never blocks launch."""
+        self._close_session_log()
+        try:
+            log_dir = core.default_data_dir() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            existing = sorted(log_dir.glob("*-server.log"))
+            for old in existing[: max(0, len(existing) - (self._SESSION_LOG_KEEP - 1))]:
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = log_dir / f"{stamp}-server.log"
+            self._log_file = path.open("a", encoding="utf-8")
+            self.append_log("normal", f"Session log: {path}")
+        except Exception:
+            self._log_file = None
+
+    def _close_session_log(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except Exception:
+                pass
+            self._log_file = None
+
+    def _write_session_log(self, text: str) -> None:
+        if self._log_file is None:
+            return
+        try:
+            self._log_file.write(text + "\n")
+            self._log_file.flush()
+        except Exception:
+            self._log_file = None
+
     def append_log(self, level: str, text: str) -> None:
         if threading.current_thread() is not threading.main_thread():
             self.log_queue.put((level, text))
@@ -2944,6 +3266,7 @@ class LauncherApp:
         self.capture_vram_allocation(text)
         self.capture_tokens_per_second(text)
         self.update_status_from_log(text)
+        self._write_session_log(text)
         self.output.configure(state="normal")
         # Drop oldest lines if log is too large
         lines = int(self.output.index("end-1c").split(".")[0])
@@ -2997,7 +3320,7 @@ class LauncherApp:
                 except ValueError:
                     pass
                 if self.tokps_var:
-                    self.tokps_var.set(f"{self.last_tokens_per_second:.2f} tok/s")
+                    self.tokps_var.set(f"last {self.last_tokens_per_second:.2f} tok/s")
 
             self._update_session_display()
         except Exception:
@@ -3012,10 +3335,35 @@ class LauncherApp:
             self.append_log(level, text)
         self.root.after(100, self.drain_log_queue)
 
+    _GEOMETRY_RE = re.compile(r"^\d+x\d+[+-]\d+[+-]\d+$")
+
+    def _initial_geometry(self) -> str:
+        """Restore the last saved window size/position, falling back to a sane default."""
+        saved = self.history.settings.get("window_geometry")
+        if isinstance(saved, str) and self._GEOMETRY_RE.match(saved):
+            return saved
+        return "1400x720"
+
+    def _save_geometry(self) -> None:
+        try:
+            geometry = self.root.geometry()
+        except Exception:
+            return
+        if self._GEOMETRY_RE.match(geometry) and geometry != self.history.settings.get("window_geometry"):
+            self.history.set_setting("window_geometry", geometry)
+
     def on_close(self) -> None:
         if self.process and self.process.poll() is None:
             if messagebox.askyesno("Server running", "The inferer server is still running. Stop it before closing?", parent=self.root):
                 self.stop_process()
+                try:
+                    self.process.wait(timeout=3)
+                except Exception:
+                    # The window is closing, so the escalation timer would never fire.
+                    self._kill_tree(self.process)
+        self._close_session_log()
+        self._stop_busy_pulse()
+        self._save_geometry()
         self.root.destroy()
 
     def run(self) -> None:
@@ -3030,14 +3378,15 @@ class LauncherApp:
             self._sigint_received = False
             if self.process and self.process.poll() is None:
                 self.append_log("warn", "SIGINT received, stopping inferer...")
+                self._signal_stop(self.process)
                 try:
-                    if os.name != "nt":
-                        os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-                    else:
-                        self.process.terminate()
+                    self.process.wait(timeout=3)
                 except Exception:
-                    self.process.terminate()
+                    self._kill_tree(self.process)
             self._save_session_stats_to_preset()
+            self._close_session_log()
+            self._stop_busy_pulse()
+            self._save_geometry()
             self.root.destroy()
             return
         self.root.after(200, self._check_sigint)

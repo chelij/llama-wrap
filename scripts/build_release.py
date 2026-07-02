@@ -74,12 +74,17 @@ def main() -> int:
         APP_NAME,
         "--windowed",
         "--onedir",
-        str(ENTRYPOINT),
     ]
+
+    # The CLI is loaded dynamically from the copied script at runtime, so
+    # PyInstaller cannot discover its optional Unix tab-completion module.
+    if platform.system().lower() != "windows":
+        command.extend(["--hidden-import", "readline"])
 
     if platform.system().lower() == "darwin":
         command.extend(["--osx-bundle-identifier", "com.chelib.llama-wrap"])
 
+    command.append(str(ENTRYPOINT))
     run(command)
 
     readme = ROOT / "README.md"

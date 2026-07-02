@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -262,6 +263,115 @@ class CoreTests(unittest.TestCase):
             core.parse_llama_vram_log_line("llama_new_context_with_model: CPU compute buffer size = 256.50 MiB")
         )
 
+    def test_metrics_skipped_for_custom_inferer(self) -> None:
+        preset = make_preset()
+        preset["inferer"] = "Custom"
+        preset["inferer_executable"] = "/usr/bin/other-server"
+        command = core.build_command_from_preset(preset)
+        self.assertNotIn("--metrics", command)
+
+    def test_metrics_added_for_llama_server_executable(self) -> None:
+        preset = make_preset()
+        preset["inferer"] = "Custom"
+        preset["inferer_executable"] = "/opt/llama/llama-server"
+        command = core.build_command_from_preset(preset)
+        self.assertIn("--metrics", command)
+
+    def test_import_unknown_flag_with_negative_value(self) -> None:
+        preset, _changed, _skipped = core.preset_from_command("neg", "llama-server -m /m.gguf --seed -1")
+        self.assertIn("--seed", preset["flags"])
+        self.assertEqual(preset["flags"]["--seed"]["value"], "-1")
+        self.assertNotIn("-1", preset["flags"])
+
+    def test_save_history_is_atomic_and_creates_parents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "history.json"
+            core.save_history(path, {"presets": [], "runs": [], "settings": {}})
+            self.assertTrue(path.exists())
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["format_version"], 1)
+            self.assertFalse(path.with_name("history.json.tmp").exists())
+
+    def test_find_history_env_override_and_platform_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_hist = Path(tmp) / "custom.json"
+            with mock.patch.dict(os.environ, {"LLAMA_WRAP_HISTORY": str(env_hist)}):
+                self.assertEqual(core.find_history(), env_hist)
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            with mock.patch.dict(os.environ):
+                os.environ.pop("LLAMA_WRAP_HISTORY", None)
+                with mock.patch.object(core, "APP_DIR", empty):
+                    found = core.find_history(cwd=empty)
+            self.assertEqual(found, core.platform_data_dir() / "history.json")
+
+    def test_classify_stress_error_categories(self) -> None:
+        cases = [
+            (core.EndpointResult(False, None, "u", error="connection reset by peer"), "connection reset"),
+            (core.EndpointResult(False, None, "u", error="timed out"), "timeout"),
+            (core.EndpointResult(False, 500, "u", error="CUDA error: out of memory"), "OOM indication"),
+            (core.EndpointResult(False, 404, "u", error="not found"), "HTTP error"),
+            (core.EndpointResult(False, None, "u", error="mystery"), "unknown"),
+        ]
+        for result, expected in cases:
+            self.assertEqual(core.classify_stress_error(result), expected)
+        overflow = core.EndpointResult(False, 400, "u", error=json.dumps({
+            "error": {"type": "exceed_context_size_error", "n_prompt_tokens": 2000, "n_ctx": 1000}
+        }))
+        self.assertEqual(core.classify_stress_error(overflow), "context overflow")
+
+    def test_probe_report_streams_lines_to_callback(self) -> None:
+        seen: list[str] = []
+        with mock.patch("llamawrap_core.http_json", return_value=core.EndpointResult(False, None, "url", error="refused")):
+            _ok, lines = core.probe_report(make_preset(), on_line=seen.append)
+        self.assertEqual(seen, lines)
+
+    def test_context_stress_cancel_before_first_request(self) -> None:
+        class Cancelled:
+            def is_set(self) -> bool:
+                return True
+
+        preset = make_preset(port=1234)
+        preset["flags"]["-c"]["value"] = "1000"
+        with mock.patch("llamawrap_core.http_json") as mocked:
+            ok, lines = core.context_stress_report(preset, cancel=Cancelled())
+        mocked.assert_not_called()
+        self.assertFalse(ok)
+        self.assertIn("Stress result: CANCELLED", lines)
+
+    def test_run_benchmark_aggregates_streamed_iterations(self) -> None:
+        preset = make_preset(port=1234)
+        stream_result = {
+            "ok": True, "status": 200, "error": "", "ttft_ms": 100.0, "total_ms": 1100.0,
+            "tokens": 11, "content": "hello world",
+            "timings": {"prompt_ms": 90.0, "prompt_per_second": 500.0, "predicted_per_second": 10.0},
+            "usage": {"completion_tokens": 11, "prompt_tokens": 12},
+        }
+        warmup = core.EndpointResult(True, 200, "url", data={"choices": [{"message": {"content": "OK"}}]})
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("llamawrap_core.http_json", return_value=warmup), \
+                 mock.patch("llamawrap_core.http_stream_chat", return_value=dict(stream_result)):
+                row, paths, lines = core.run_benchmark(preset, out_dir=Path(tmp))
+            self.assertEqual(row["status"], "pass")
+            self.assertEqual(row["iterations"], 3)
+            self.assertEqual(row["ttft_ms"], 90.0)
+            self.assertEqual(row["generation_tokens_per_second"], 10.0)
+            self.assertEqual(row["prefill_tokens_per_second"], 500.0)
+            self.assertEqual(row["tokens_per_second"], 10.0)
+            self.assertTrue(paths)
+            self.assertTrue(any("[PASS] benchmark" in line for line in lines))
+
+    def test_run_benchmark_reports_warmup_failure(self) -> None:
+        preset = make_preset(port=1234)
+        warmup = core.EndpointResult(False, None, "url", error="refused")
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("llamawrap_core.http_json", return_value=warmup), \
+                 mock.patch("llamawrap_core.http_stream_chat") as stream:
+                row, _paths, lines = core.run_benchmark(preset, out_dir=Path(tmp))
+            stream.assert_not_called()
+            self.assertEqual(row["status"], "fail")
+            self.assertIn("refused", row["error"])
+            self.assertTrue(any("Benchmark request failed." in line for line in lines))
+
     def test_vram_calibration_matches_command_and_model_signature(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = Path(tmp) / "model.gguf"
@@ -279,6 +389,77 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(core.calibration_matches(calibration, command, str(model)))
             self.assertEqual(calibration["correction_ratio"], 1.25)
             self.assertFalse(core.calibration_matches(calibration, command + ["--no-webui"], str(model)))
+
+
+def _gguf_bytes(pairs: list[tuple[str, int]]) -> bytes:
+    """Minimal GGUF v3 header with uint32 metadata values."""
+
+    def kv(key: str, value: int) -> bytes:
+        encoded = key.encode("utf-8")
+        return struct.pack("<Q", len(encoded)) + encoded + struct.pack("<I", 4) + struct.pack("<I", value)
+
+    header = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0) + struct.pack("<Q", len(pairs))
+    return header + b"".join(kv(key, value) for key, value in pairs)
+
+
+class GGUFParserTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        import llamawrap as gui  # tk import is guarded, safe headless
+
+        cls.gui = gui
+
+    def test_parse_gguf_reads_core_metadata(self) -> None:
+        pairs = [
+            ("llama.block_count", 32),
+            ("llama.embedding_length", 4096),
+            ("llama.attention.head_count_kv", 8),
+            ("llama.attention.key_length", 128),
+            ("llama.attention.value_length", 128),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.gguf"
+            path.write_bytes(_gguf_bytes(pairs))
+            meta = self.gui.parse_gguf(str(path))
+        self.assertEqual(meta.n_layers, 32)
+        self.assertEqual(meta.n_embd, 4096)
+        self.assertEqual(meta.n_kv_heads, 8)
+        self.assertEqual(meta.n_embd_k_gqa, 128)
+        self.assertEqual(meta.n_embd_v_gqa, 128)
+        self.assertEqual(meta.warnings, [])
+
+    def test_parse_gguf_skips_irrelevant_keys(self) -> None:
+        pairs = [
+            ("general.some_other_key", 7),
+            ("llama.block_count", 16),
+            ("llama.embedding_length", 2048),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.gguf"
+            path.write_bytes(_gguf_bytes(pairs))
+            meta = self.gui.parse_gguf(str(path))
+        self.assertEqual(meta.n_layers, 16)
+        self.assertEqual(meta.n_embd, 2048)
+
+    def test_parse_gguf_non_gguf_file_warns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.gguf"
+            path.write_bytes(b"this is not a gguf file")
+            meta = self.gui.parse_gguf(str(path))
+        self.assertEqual(meta.n_layers, 0)
+        self.assertTrue(meta.warnings)
+
+    def test_parse_gguf_truncated_metadata_warns_instead_of_crashing(self) -> None:
+        pairs = [("llama.block_count", 32)]
+        data = _gguf_bytes(pairs)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.gguf"
+            truncated = data[:-2]
+            # Claim more metadata entries than the file contains.
+            truncated = truncated[:16] + struct.pack("<Q", 5) + truncated[24:]
+            path.write_bytes(truncated)
+            meta = self.gui.parse_gguf(str(path))
+        self.assertTrue(meta.warnings)
 
 
 class LocalOpenAIHandler(BaseHTTPRequestHandler):
@@ -306,6 +487,33 @@ class LocalOpenAIHandler(BaseHTTPRequestHandler):
             return
         if self.path != "/v1/chat/completions":
             self._json(404, {"error": "not found"})
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length).decode("utf-8") if length else "{}"
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            payload = {}
+        if payload.get("stream"):
+            chunks = [
+                {"choices": [{"delta": {"content": "OK"}}]},
+                {"choices": [{"delta": {"content": " done"}}]},
+                {
+                    "choices": [{"delta": {}}],
+                    "usage": {"completion_tokens": 2, "prompt_tokens": 5},
+                    "timings": {
+                        "prompt_ms": 1.0, "prompt_per_second": 5000.0,
+                        "predicted_n": 2, "predicted_ms": 2.0, "predicted_per_second": 1000.0,
+                    },
+                },
+            ]
+            sse = b"".join(b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\n" for chunk in chunks)
+            sse += b"data: [DONE]\n\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Content-Length", str(len(sse)))
+            self.end_headers()
+            self.wfile.write(sse)
             return
         self._json(200, {
             "choices": [{"message": {"content": "OK"}}],

@@ -167,7 +167,7 @@ python llamawrap.py bench "My Model"
 python llamawrap.py stress "My Model"
 ```
 
-Bench results are saved under `.llama-wrap/benchmarks` by default. For CSV output:
+Bench runs a warmup plus several streamed iterations and reports median TTFT, generation tok/s, and prefill tok/s (when the server provides timings). Results are saved under the llama-wrap data directory (`benchmarks/`) by default. For CSV output:
 
 ```bash
 python llamawrap.py bench "My Model" --csv
@@ -256,10 +256,13 @@ llamawrap-cli help run
 
 ## Presets and Storage
 
-Presets are stored in `history.json`.
+Presets are stored in `history.json`. The file is found in this order:
 
-- From source: next to `llamawrap.py`
-- Release build: next to the launcher binary
+- `LLAMA_WRAP_HISTORY` environment variable, when set
+- an existing `history.json` next to `llamawrap.py` / the launcher binary (portable installs keep working)
+- otherwise the per-user data directory: `~/.config/llama-wrap` on Linux, `~/Library/Application Support/llama-wrap` on macOS, `%APPDATA%\llama-wrap` on Windows
+
+New installs default to the per-user directory so the app works even when installed somewhere read-only. Writes are atomic (temp file + rename), so a crash mid-save cannot corrupt existing presets.
 
 Each preset stores:
 
@@ -272,7 +275,7 @@ Each preset stores:
 
 Recent run commands are also saved, capped to the latest 100 entries.
 
-Benchmark outputs are stored under `.llama-wrap/benchmarks` by default. That local data folder is ignored by git and is safe to delete when you no longer need the reports.
+Benchmark outputs and rotating server session logs are stored under the same data directory (`benchmarks/` and `logs/`). A portable `.llama-wrap` folder next to the app is used instead when it already exists; that local folder is ignored by git and is safe to delete when you no longer need the reports.
 
 ## Importing Existing Commands
 

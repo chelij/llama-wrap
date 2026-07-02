@@ -19,11 +19,11 @@ Usage:
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
 import shlex
-import readline
 import shutil
 import subprocess
 import sys
@@ -31,35 +31,26 @@ import time
 import urllib.request
 from pathlib import Path
 
+try:
+    import readline
+except ImportError:  # Not available in the standard Windows Python build.
+    readline = None
+
 import llamawrap_core as core
 
 
 def find_history() -> Path:
-    """Locate history.json next to the script or in the working directory."""
-    env_path = os.environ.get("LLAMA_WRAP_HISTORY")
-    if env_path:
-        return Path(env_path).expanduser()
-    candidates = [
-        Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None,
-        Path(__file__).resolve().parent,
-        Path.cwd(),
-    ]
-    for c in candidates:
-        if c is None:
-            continue
-        p = c / "history.json"
-        if p.exists():
-            return p
-    # Fallback: current dir
-    return Path.cwd() / "history.json"
+    """Locate history.json (env override, app dir, cwd, then per-user data dir)."""
+    return core.find_history(sys.argv[0])
 
 
 def load_history(path: Path) -> dict:
-    if not path.exists():
+    """Shared core loader with CLI-style error exits."""
+    try:
+        return core.load_history(path)
+    except FileNotFoundError:
         print(f"error: {path} not found", file=sys.stderr)
         sys.exit(1)
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"error: cannot read {path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -68,32 +59,146 @@ def load_history(path: Path) -> dict:
 def load_or_init_history(path: Path) -> dict:
     if path.exists():
         return load_history(path)
-    return {
-        "format_version": 1,
-        "presets": [],
-        "runs": [],
-        "settings": {},
-    }
+    return core.load_or_init_history(path)
 
 
 def save_history(path: Path, data: dict) -> None:
-    data["format_version"] = data.get("format_version", 1)
-    data["presets"] = data.get("presets", [])
-    data["runs"] = (data.get("runs") or [])[-100:]
-    data["settings"] = data.get("settings", {})
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    core.save_history(path, data)
 
 
 def find_preset(data: dict, name: str) -> dict | None:
-    for p in data.get("presets", []):
-        if p.get("preset_name") == name:
-            return p
-    return None
+    return core.find_preset(data, name)
 
 
 def error(msg: str) -> None:
-    print(f"error: {msg}", file=sys.stderr)
+    print(f"{red('error:')} {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+# ───────────────────────────────────────
+#  Color / quiet output mode
+#
+#  Plain ANSI escapes, no dependency. Disabled automatically when stdout
+#  is not a terminal or NO_COLOR is set; can also be forced off with
+#  --no-color. --quiet trims non-essential informational lines.
+# ───────────────────────────────────────
+
+COLOR_ENABLED = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+QUIET = False
+
+
+def set_color_enabled(enabled: bool) -> None:
+    global COLOR_ENABLED
+    COLOR_ENABLED = enabled
+
+
+def set_quiet(enabled: bool) -> None:
+    global QUIET
+    QUIET = enabled
+
+
+def _c(text: str, code: str) -> str:
+    if not COLOR_ENABLED or not text:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def bold(text: str) -> str:
+    return _c(text, "1")
+
+
+def dim(text: str) -> str:
+    return _c(text, "2")
+
+
+def red(text: str) -> str:
+    return _c(text, "31")
+
+
+def green(text: str) -> str:
+    return _c(text, "32")
+
+
+def yellow(text: str) -> str:
+    return _c(text, "33")
+
+
+def cyan(text: str) -> str:
+    return _c(text, "36")
+
+
+_STATUS_COLOR = {"PASS": green, "FAIL": red, "WARN": yellow, "SKIP": dim}
+_STATUS_LINE_RE = re.compile(r"^\[(PASS|FAIL|WARN|SKIP)\]\s*([^:]+):?\s*(.*)$")
+_RESULT_LINE_RE = re.compile(r"^(.+ result): (PASS|FAIL)$")
+_HEADER_LINE_RE = re.compile(r"^(Doctor|Probe|Bench|Stress): (.+)$")
+
+
+def print_diagnostic_lines(lines: list[str]) -> None:
+    """Print Doctor/Probe/Bench/Stress report lines as an aligned, color-coded list.
+
+    Falls back to printing the line unmodified when it doesn't match a
+    recognized status/result/header shape, so unusual output is never lost.
+    """
+    parsed = [_STATUS_LINE_RE.match(line.strip()) for line in lines]
+    label_width = min(max((len(m.group(2).strip()) for m in parsed if m), default=0), 32)
+
+    for line, m in zip(lines, parsed):
+        stripped = line.strip()
+        if m:
+            status, label, detail = m.group(1), m.group(2).strip(), m.group(3).strip()
+            if QUIET and status in ("PASS", "SKIP"):
+                continue
+            color = _STATUS_COLOR.get(status, lambda t: t)
+            tag = color(bold(f"[{status}]"))
+            if detail:
+                print(f"  {tag} {label:<{label_width}}  {detail}")
+            else:
+                print(f"  {tag} {label}")
+            continue
+        rm = _RESULT_LINE_RE.match(stripped)
+        if rm:
+            label, status = rm.group(1), rm.group(2)
+            color = _STATUS_COLOR.get(status, lambda t: t)
+            print(f"{label}: {color(bold(status))}")
+            continue
+        hm = _HEADER_LINE_RE.match(stripped)
+        if hm:
+            if not QUIET:
+                print(bold(stripped))
+            continue
+        if QUIET and stripped.startswith("saved:"):
+            continue
+        print(line)
+
+
+def resolve_preset(data: dict, name: str) -> dict:
+    """Find a preset by exact name, unique substring, or suggest close matches.
+
+    Exits via error() (no return) when nothing usable is found, matching the
+    existing call-site pattern of `preset = find_preset(...); if not preset: error(...)`.
+    """
+    preset = find_preset(data, name)
+    if preset:
+        return preset
+
+    presets = data.get("presets", [])
+    lname = name.lower()
+    substring_matches = [p for p in presets if lname in p.get("preset_name", "").lower()]
+    if len(substring_matches) == 1:
+        match = substring_matches[0]
+        if not QUIET:
+            print(dim(f"  (matched '{name}' -> '{match.get('preset_name')}')"))
+        return match
+    if len(substring_matches) > 1:
+        names = ", ".join(repr(p.get("preset_name", "")) for p in substring_matches)
+        error(f"preset '{name}' is ambiguous, matches: {names}")
+
+    all_names = [p.get("preset_name", "") for p in presets]
+    suggestions = difflib.get_close_matches(name, all_names, n=3, cutoff=0.5)
+    if suggestions:
+        hint = ", ".join(repr(s) for s in suggestions)
+        error(f"preset '{name}' not found. did you mean: {hint}?")
+    error(f"preset '{name}' not found")
 
 
 # ───────────────────────────────────────
@@ -268,6 +373,9 @@ def _path_matches(text: str, *, files_only: bool = False, suffixes: tuple[str, .
 
 
 def input_path(prompt: str, *, optional: bool = False, suffixes: tuple[str, ...] = ()) -> str:
+    if readline is None:
+        return input(prompt).strip()
+
     old_completer = readline.get_completer()
     old_delims = readline.get_completer_delims()
 
@@ -454,15 +562,13 @@ def cmd_list(data: dict) -> None:
     for p in presets:
         name = p.get("preset_name", "?")
         model = Path(p.get("model_path", "")).name or "(no model)"
-        print(f"  {name:<{width}}  {model}")
+        print(f"  {cyan(f'{name:<{width}}')}  {dim(model)}")
 
 
 def cmd_show(data: dict, name: str) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
 
-    print(f"Preset: {preset['preset_name']}")
+    print(f"Preset: {bold(preset['preset_name'])}")
     print(f"  Inferer:         {preset.get('inferer', 'llama.cpp')}")
     print(f"  Executable:      {preset.get('inferer_executable', 'llama-server')}")
     print(f"  Model:           {preset.get('model_path', '')}")
@@ -506,9 +612,7 @@ def cmd_show(data: dict, name: str) -> None:
 
 
 def cmd_set(data: dict, path: Path, name: str, flag: str, value: str) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
     flags = preset.setdefault("flags", {})
     if flag not in flags:
         flags[flag] = {
@@ -526,9 +630,7 @@ def cmd_set(data: dict, path: Path, name: str, flag: str, value: str) -> None:
 
 
 def cmd_enable(data: dict, path: Path, name: str, flag: str) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
     flags = preset.setdefault("flags", {})
     if flag not in flags:
         flags[flag] = {
@@ -550,9 +652,7 @@ def cmd_enable(data: dict, path: Path, name: str, flag: str) -> None:
 
 
 def cmd_disable(data: dict, path: Path, name: str, flag: str) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
     flags = preset.setdefault("flags", {})
     if flag in flags:
         flags[flag]["enabled"] = False
@@ -561,9 +661,7 @@ def cmd_disable(data: dict, path: Path, name: str, flag: str) -> None:
 
 
 def cmd_rmflag(data: dict, path: Path, name: str, flag: str) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
     flags = preset.get("flags", {})
     if flag not in flags:
         error(f"flag '{flag}' not in preset '{name}'")
@@ -577,9 +675,7 @@ def cmd_rmflag(data: dict, path: Path, name: str, flag: str) -> None:
 
 
 def cmd_rename(data: dict, path: Path, name: str, new_name: str) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
     if find_preset(data, new_name):
         error(f"preset '{new_name}' already exists")
     preset["preset_name"] = new_name
@@ -588,12 +684,14 @@ def cmd_rename(data: dict, path: Path, name: str, new_name: str) -> None:
 
 
 def cmd_delete(data: dict, path: Path, name: str) -> None:
+    preset = resolve_preset(data, name)
+    actual_name = preset.get("preset_name", name)
     presets = data.get("presets", [])
     for i, p in enumerate(presets):
-        if p.get("preset_name") == name:
+        if p is preset:
             presets.pop(i)
             save_history(path, data)
-            print(f"  deleted '{name}'")
+            print(f"  deleted '{actual_name}'")
             return
     error(f"preset '{name}' not found")
 
@@ -785,24 +883,34 @@ def _save_cli_session_stats(
         pass
 
 
-def kill_process_on_port(port: int | None) -> None:
-    if port and os.name != "nt" and shutil.which("lsof"):
-        try:
-            subprocess.check_output(
-                ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
-                text=True, stderr=subprocess.DEVNULL, timeout=3,
-            )
-            print(f"  killing process on port {port}...")
-            subprocess.run(
-                ["kill"] + subprocess.check_output(
-                    ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
-                    text=True, stderr=subprocess.DEVNULL, timeout=3,
-                ).strip().split(),
-                timeout=3,
-            )
-            time.sleep(0.5)
-        except Exception:
-            pass
+def kill_process_on_port(port: int | None, expected_name: str = "") -> None:
+    """Free the launch port without silently killing unrelated processes.
+
+    Processes matching the inferer executable name are stopped automatically.
+    Anything else prompts on a terminal, or aborts when not interactive."""
+    if not port:
+        return
+    occupants = core.processes_on_port(port)
+    if not occupants:
+        return
+    for pid, name in occupants:
+        matches = expected_name and name != "unknown" and name.startswith(expected_name)
+        if not matches:
+            if sys.stdin.isatty():
+                answer = input(f"  port {port} is in use by '{name}' (pid {pid}). Stop it? [y/N] ").strip().lower()
+                if answer not in ("y", "yes"):
+                    error(f"port {port} is in use by '{name}' (pid {pid}); stop it or change --port")
+            else:
+                error(f"port {port} is in use by '{name}' (pid {pid}); stop it or change --port")
+        print(f"  stopping process on port {port}: {name} (pid {pid})")
+        core.terminate_pid(pid)
+    deadline = time.time() + 3
+    while time.time() < deadline and core.processes_on_port(port):
+        time.sleep(0.2)
+    for pid, name in core.processes_on_port(port):
+        print(f"  {name} (pid {pid}) did not exit; force stopping")
+        core.terminate_pid(pid, force=True)
+        time.sleep(0.3)
 
 
 def get_port_from_preset(preset: dict) -> int | None:
@@ -816,9 +924,7 @@ def get_port_from_preset(preset: dict) -> int | None:
 
 
 def cmd_run(data: dict, name: str, auto: bool = False, history_path: Path | None = None) -> None:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
 
     command = build_command_from_preset(preset)
 
@@ -833,22 +939,19 @@ def cmd_run(data: dict, name: str, auto: bool = False, history_path: Path | None
         error(f"executable '{executable}' not found")
 
     port = get_port_from_preset(preset)
-    kill_process_on_port(port)
+    kill_process_on_port(port, expected_name=Path(executable).name)
     run_process(command, auto=auto, preset_name=name, history_path=history_path, port=port)
 
 
 def _require_preset(data: dict, name: str) -> dict:
-    preset = find_preset(data, name)
-    if not preset:
-        error(f"preset '{name}' not found")
+    preset = resolve_preset(data, name)
     return preset
 
 
 def cmd_doctor(data: dict, name: str) -> None:
     preset = _require_preset(data, name)
     ok, lines = core.doctor_report(preset)
-    for line in lines:
-        print(line)
+    print_diagnostic_lines(lines)
     if not ok:
         sys.exit(1)
 
@@ -856,8 +959,7 @@ def cmd_doctor(data: dict, name: str) -> None:
 def cmd_probe(data: dict, name: str) -> None:
     preset = _require_preset(data, name)
     ok, lines = core.probe_report(preset)
-    for line in lines:
-        print(line)
+    print_diagnostic_lines(lines)
     if not ok:
         sys.exit(1)
 
@@ -882,18 +984,28 @@ def cmd_bench(data: dict, args: list[str]) -> None:
         else:
             error(f"unknown bench option: {arg}")
     preset = _require_preset(data, name)
-    row, _paths, lines = core.run_benchmark(preset, out_dir=out_dir, csv_out=csv_out)
-    for line in lines:
-        print(line)
+    try:
+        row, _paths, _lines = core.run_benchmark(
+            preset, out_dir=out_dir, csv_out=csv_out,
+            on_line=lambda line: print_diagnostic_lines([line]),
+        )
+    except KeyboardInterrupt:
+        print("\nbench cancelled")
+        sys.exit(130)
     if row.get("status") != "pass":
         sys.exit(1)
 
 
 def cmd_stress(data: dict, name: str) -> None:
     preset = _require_preset(data, name)
-    ok, lines = core.context_stress_report(preset)
-    for line in lines:
-        print(line)
+    try:
+        ok, _lines = core.context_stress_report(
+            preset,
+            on_line=lambda line: print_diagnostic_lines([line]),
+        )
+    except KeyboardInterrupt:
+        print("\nstress cancelled")
+        sys.exit(130)
     if not ok:
         sys.exit(1)
 
@@ -948,7 +1060,7 @@ HELP_TEXT = """Commands:
   import  <name> <command>    Import a pasted launch command as a preset.
   doctor  <name>              Check executable, paths, port, and API endpoints.
   probe   <name>              Send one OpenAI-compatible chat request.
-  bench   <name>              Run one short benchmark request and save results.
+  bench   <name>              Run repeatable streamed benchmarks and save results.
   stress  <name>              Run the same context stress suite as the GUI.
   export-presets --out <file> Export presets to a portable JSON bundle.
   import-presets <file>       Import presets from an exported JSON bundle.
@@ -962,6 +1074,12 @@ HELP_TEXT = """Commands:
   run     <name> [--auto]     Build and launch the server command from a preset.
                               --auto restarts the process if it crashes.
   help    [command]           Show this help or details for a specific command.
+
+Global flags (any command, any position):
+  --no-color                  Disable ANSI color even on a terminal.
+  --quiet, -q                 Trim PASS/SKIP lines and headers from diagnostic output.
+
+Color is auto-disabled when stdout isn't a terminal or NO_COLOR is set.
 """
 
 HELP_DETAIL = {
@@ -970,7 +1088,7 @@ HELP_DETAIL = {
     "import": "import <preset-name> <command-or-args...> [--force]\n    Import a llama-server command or launch args as a preset. Recognized\n    flags are stored as normal preset fields; unknown flags are preserved.\n\n    Examples:\n      llamawrap-cli import \"My Model\" llama-server -m /models/model.gguf -ngl all -c 32768\n      llamawrap-cli import \"Args Only\" -m /models/model.gguf --port 8080",
     "doctor": "doctor <preset-name>\n    Check the preset executable, model paths, configured host/port,\n    /health, /v1/models, and /v1/chat/completions.",
     "probe": "probe <preset-name>\n    Send one small OpenAI-compatible /v1/chat/completions request to the\n    configured running endpoint and print pass/fail details.",
-    "bench": "bench <preset-name> [--csv] [--out-dir <dir>]\n    Send one short controlled prompt to the configured running endpoint,\n    report latency and token speed when available, and save JSON results\n    under .llama-wrap/benchmarks by default. --csv saves a CSV copy too.",
+    "bench": "bench <preset-name> [--csv] [--out-dir <dir>]\n    Run a warmup plus several streamed benchmark iterations against the\n    configured running endpoint, reporting median TTFT, generation tok/s,\n    and prefill tok/s when the server provides timings. JSON results are\n    saved under the llama-wrap data directory by default (a portable\n    .llama-wrap folder next to the app is used when present).\n    --csv saves a CSV copy too.",
     "stress": "stress <preset-name>\n    Run the same percentage-based context stress suite as the GUI Stress\n    button: runtime context detection, fill/decode stages, sustained synthetic\n    coding-agent turns, boundary probes, error classification, and a practical\n    working-limit summary.",
     "export-presets": "export-presets --out <file> [--portable] [preset-name...]\n    Export all presets, or selected preset names, to a JSON bundle.\n    Absolute paths are preserved and reported as portability warnings.",
     "import-presets": "import-presets <file> [--force]\n    Import presets from an export-presets JSON bundle. Existing preset names\n    are skipped unless --force is supplied. This does not change the older\n    import <name> <command> command.",
@@ -981,7 +1099,7 @@ HELP_DETAIL = {
     "rmflag": "rmflag <preset-name> <flag>\n    Remove a flag from the preset entirely. The flag is added to\n    hidden_flags so the GUI won't show it either.",
     "rename": "rename <preset-name> <new-name>\n    Rename a preset. Fails if a preset with the new name already exists.",
     "delete": "delete <preset-name>\n    Permanently delete a preset from history.json.",
-    "run": "run <preset-name> [--auto]\n    Build the full server command from the preset, kill any existing\n    process on the configured port, launch the server, and stream its\n    output to the terminal. Press Ctrl+C to stop.\n\n    --auto  Restart the process automatically if it crashes (non-zero exit).\n            Press Ctrl+C once to stop gracefully.\n\n    Example:\n      llamawrap-cli run \"My Model\" --auto",
+    "run": "run <preset-name> [--auto]\n    Build the full server command from the preset, free the configured\n    port (stopping a matching inferer automatically; asking first for\n    anything else), launch the server, and stream its output to the\n    terminal. Press Ctrl+C to stop.\n\n    --auto  Restart the process automatically if it crashes (non-zero exit).\n            Press Ctrl+C once to stop gracefully.\n\n    Example:\n      llamawrap-cli run \"My Model\" --auto",
 }
 
 
@@ -1005,23 +1123,35 @@ def interactive_browse(history_path: Path) -> None:
     """Interactive preset browser — default mode when no command is given."""
     data = load_or_init_history(history_path)
     presets = data.get("presets", [])
+    show_help = True
 
     while True:
-        print("\n── Presets ──")
+        print(f"\n── {bold('Presets')} ──")
         if not presets:
             print("  (no presets)")
         else:
             for i, p in enumerate(presets, 1):
                 name = p.get("preset_name", "?")
                 model = Path(p.get("model_path", "")).name or "(no model)"
-                print(f"  {i:>2}. {name}  ({model})")
+                print(f"  {cyan(f'{i:>2}.')} {name}  {dim(f'({model})')}")
+        if show_help:
+            print()
+            print("  c     create a new preset")
+            print("  i     import a pasted launch command")
+            print("  r     reload presets")
+            print("  q     quit")
+            print("  ?     show this help again")
+            show_help = False
         print()
         try:
-            choice = input("Enter number to select, c to create, i to import, r to reload, q to quit: ").strip()
+            choice = input("Select a preset number, or [c/i/r/q/?]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
+        if choice == "?":
+            show_help = True
+            continue
         if choice == "q":
             break
         if choice == "c":
@@ -1051,7 +1181,7 @@ def interactive_browse(history_path: Path) -> None:
                 print("  invalid number")
                 continue
         except ValueError:
-            print("  enter a number, r, or q")
+            print("  enter a number, or c/i/r/q/?")
             continue
 
         preset = presets[idx]
@@ -1064,8 +1194,17 @@ def interactive_browse(history_path: Path) -> None:
 def interactive_preset_shell(preset: dict, history_path: Path, data: dict) -> None:
     """Interactive shell for a selected preset."""
     name = preset.get("preset_name", "?")
+    actions = (
+        ("s", "show full details"),
+        ("f", "edit flags"),
+        ("r", "run (launch server)"),
+        ("a", "run with auto-restart on crash"),
+        ("d", "delete this preset"),
+        ("b", "back to list"),
+    )
+    show_help = True
     while True:
-        print(f"\n── {name} ──")
+        print(f"\n── {bold(name)} ──")
         model = preset.get("model_path", "") or "(no model)"
         print(f"  Model:  {model}")
         flags = preset.get("flags", {})
@@ -1082,19 +1221,21 @@ def interactive_preset_shell(preset: dict, history_path: Path, data: dict) -> No
                 parts.append(f"{stats['auto_restarts']} restarts")
             if parts:
                 print(f"  Last:   {' | '.join(parts)}")
-        print()
-        print("  s     show full details")
-        print("  f     edit flags")
-        print("  r     run (launch server)")
-        print("  a     run with auto-restart on crash")
-        print("  d     delete this preset")
-        print("  b     back to list")
+        if show_help:
+            print()
+            for key, desc in actions:
+                print(f"  {bold(key)}     {desc}")
+            print(f"  {bold('?')}     show this help again")
+            show_help = False
         try:
-            action = input("\nAction: ").strip().lower()
+            action = input(f"\nAction [{'/'.join(k for k, _ in actions)}/?]: ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             break
 
+        if action == "?":
+            show_help = True
+            continue
         if action == "b":
             break
         elif action == "s":
@@ -1126,7 +1267,7 @@ def interactive_preset_shell(preset: dict, history_path: Path, data: dict) -> No
                 cmd_delete(data, history_path, name)
                 break
         else:
-            print("  unknown action")
+            print("  unknown action (? for help)")
 
 
 def _make_flag_completer(flag_names: list[str]):
@@ -1159,11 +1300,12 @@ def interactive_flag_editor(preset: dict, history_path: Path, data: dict) -> Non
     print(f"\n── Flags: {name} ──")
     # Set up tab completion
     flag_names = sorted(preset.get("flags", {}).keys())
-    old_completer = readline.get_completer()
-    old_delims = readline.get_completer_delims()
-    readline.set_completer(_make_flag_completer(flag_names))
-    readline.set_completer_delims(" \t\n")
-    readline.parse_and_bind("tab: complete")
+    old_completer = readline.get_completer() if readline is not None else None
+    old_delims = readline.get_completer_delims() if readline is not None else None
+    if readline is not None:
+        readline.set_completer(_make_flag_completer(flag_names))
+        readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
     while True:
         flags = preset.get("flags", {})
         enabled_flags = {f: c for f, c in flags.items() if isinstance(c, dict) and c.get("enabled", False)}
@@ -1210,14 +1352,21 @@ def interactive_flag_editor(preset: dict, history_path: Path, data: dict) -> Non
         except SystemExit:
             pass
 
-    readline.set_completer(old_completer)
-    readline.set_completer_delims(old_delims)
+    if readline is not None:
+        readline.set_completer(old_completer)
+        readline.set_completer_delims(old_delims)
 
 
 def main() -> None:
     history_path = find_history()
 
     args = sys.argv[1:]
+    if "--no-color" in args:
+        args = [a for a in args if a != "--no-color"]
+        set_color_enabled(False)
+    if "--quiet" in args or "-q" in args:
+        args = [a for a in args if a not in ("--quiet", "-q")]
+        set_quiet(True)
     if not args:
         interactive_browse(history_path)
         return

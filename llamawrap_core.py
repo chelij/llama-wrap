@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import urllib.error
@@ -26,6 +27,10 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_TIMEOUT = 5.0
 BENCH_PROMPT = "Reply with one short sentence about local AI diagnostics."
+BENCH_WARMUP_PROMPT = "Warmup request. Reply with OK."
+BENCH_ITERATIONS = 3
+BENCH_MAX_TOKENS = 128
+BENCH_TIMEOUT = 120.0
 STRESS_CONTEXT_FRACTION = 0.70
 STRESS_MAX_PROMPT_TOKENS = 262_144
 STRESS_MAX_OUTPUT_TOKENS = 2048
@@ -115,6 +120,60 @@ class EndpointResult:
     elapsed_ms: float = 0.0
 
 
+class LineSink:
+    """Collects report lines and optionally forwards each one to a callback as it is produced,
+    so long-running diagnostics can stream progress instead of staying silent until the end."""
+
+    def __init__(self, on_line: Any = None) -> None:
+        self.lines: list[str] = []
+        self._on_line = on_line
+
+    def add(self, line: str) -> None:
+        self.lines.append(line)
+        if self._on_line is not None:
+            try:
+                self._on_line(line)
+            except Exception:
+                pass
+
+    def extend(self, lines: list[str]) -> None:
+        for line in lines:
+            self.add(line)
+
+
+def cancel_requested(cancel: Any) -> bool:
+    """True when the caller-supplied cancel token (e.g. threading.Event) is set."""
+    return cancel is not None and bool(cancel.is_set())
+
+
+def platform_data_dir() -> Path:
+    """Per-user llama-wrap data directory for this platform."""
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+    return base / "llama-wrap"
+
+
+def default_data_dir() -> Path:
+    """Directory for benchmarks/logs: the portable `.llama-wrap` folder next to the app
+    when it already exists, otherwise the per-user platform data directory."""
+    portable = APP_DIR / LOCAL_DATA_DIR
+    if portable.exists():
+        return portable
+    return platform_data_dir()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    """Write text via a temp file + rename so a crash mid-write never corrupts the target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def find_history(argv0: str | None = None, cwd: Path | None = None) -> Path:
     env_path = os.environ.get("LLAMA_WRAP_HISTORY")
     if env_path:
@@ -130,7 +189,9 @@ def find_history(argv0: str | None = None, cwd: Path | None = None) -> Path:
         path = candidate / "history.json"
         if path.exists():
             return path
-    return (cwd or Path.cwd()) / "history.json"
+    # No existing history anywhere: default new installs to the per-user data dir,
+    # which stays writable even when the app itself is installed read-only.
+    return platform_data_dir() / "history.json"
 
 
 def load_history(path: Path) -> dict[str, Any]:
@@ -154,8 +215,7 @@ def normalize_history(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def save_history(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(normalize_history(data), indent=2), encoding="utf-8")
+    atomic_write_text(path, json.dumps(normalize_history(data), indent=2))
 
 
 def find_preset(data: dict[str, Any], name: str) -> dict[str, Any] | None:
@@ -205,6 +265,82 @@ def default_cli_flags() -> dict[str, dict[str, Any]]:
         "--jinja": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
         "--mmproj": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
     }
+
+
+NEGATIVE_NUMBER_RE = re.compile(r"^-\d+(?:\.\d+)?$")
+
+
+def processes_on_port(port: int) -> list[tuple[int, str]]:
+    """Return (pid, process name) for every process listening on the TCP port."""
+    pids: list[int] = []
+    if os.name == "nt":
+        try:
+            output = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"], text=True, stderr=subprocess.DEVNULL, timeout=5
+            )
+        except Exception:
+            return []
+        for line in output.splitlines():
+            parts = line.split()
+            if (
+                len(parts) >= 5
+                and parts[0].upper() == "TCP"
+                and parts[3].upper() == "LISTENING"
+                and parts[1].endswith(f":{port}")
+            ):
+                try:
+                    pids.append(int(parts[4]))
+                except ValueError:
+                    continue
+    elif shutil.which("lsof"):
+        try:
+            output = subprocess.check_output(
+                ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"], text=True, stderr=subprocess.DEVNULL, timeout=3
+            )
+        except Exception:
+            return []
+        for pid_text in output.splitlines():
+            try:
+                pids.append(int(pid_text))
+            except ValueError:
+                continue
+    return [(pid, process_name(pid)) for pid in dict.fromkeys(pids)]
+
+
+def process_name(pid: int) -> str:
+    """Best-effort name of a process, or 'unknown'."""
+    try:
+        if os.name == "nt":
+            output = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True, stderr=subprocess.DEVNULL, timeout=5,
+            )
+            first = output.strip().splitlines()[0] if output.strip() else ""
+            if first.startswith('"'):
+                return first.split('","')[0].strip('"')
+        else:
+            output = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "comm="], text=True, stderr=subprocess.DEVNULL, timeout=3
+            )
+            if output.strip():
+                return Path(output.strip()).name
+    except Exception:
+        pass
+    return "unknown"
+
+
+def terminate_pid(pid: int, *, force: bool = False) -> None:
+    """Terminate a process (and its tree on Windows). Errors are swallowed."""
+    try:
+        if os.name == "nt":
+            command = ["taskkill", "/PID", str(pid), "/T"] + (["/F"] if force else [])
+            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        else:
+            import signal as _signal
+
+            os.kill(pid, _signal.SIGKILL if force else _signal.SIGTERM)
+    except Exception:
+        pass
 
 
 def consume_import_value(tokens: list[str], idx: int, inline_value: str | None, flag: str) -> tuple[str, int]:
@@ -268,10 +404,12 @@ def preset_from_command(name: str, command_text: str) -> tuple[dict[str, Any], i
                 skipped.append(token)
                 extra_tokens.extend([token, value])
             changed += 1
-        elif token.startswith("-"):
+        elif token.startswith("-") and not NEGATIVE_NUMBER_RE.match(token):
             value = inline_value or ""
             value_required = inline_value is not None
-            if inline_value is None and idx + 1 < len(tokens) and not tokens[idx + 1].startswith("-"):
+            if inline_value is None and idx + 1 < len(tokens) and (
+                not tokens[idx + 1].startswith("-") or NEGATIVE_NUMBER_RE.match(tokens[idx + 1])
+            ):
                 idx += 1
                 value = tokens[idx]
                 value_required = True
@@ -356,9 +494,21 @@ def build_command_from_preset(preset: dict[str, Any], *, validate_paths: bool = 
         except ValueError as exc:
             raise ValueError(f"invalid extra_args in preset: {exc}") from exc
 
-    if "--metrics" not in command:
+    # --metrics is a llama-server flag; forcing it on a custom inferer that
+    # doesn't know it would prevent the server from starting.
+    if is_llama_cpp_preset(preset) and "--metrics" not in command:
         command.append("--metrics")
     return command
+
+
+def is_llama_cpp_preset(preset: dict[str, Any]) -> bool:
+    if str(preset.get("inferer", "")).strip().lower() == "llama.cpp":
+        return True
+    try:
+        executable = shlex.split(preset.get("inferer_executable", "llama-server"))
+    except ValueError:
+        return False
+    return bool(executable) and Path(executable[0]).name.startswith("llama-server")
 
 
 def preset_endpoint(preset: dict[str, Any]) -> tuple[str, int]:
@@ -683,7 +833,6 @@ def run_stress_request(
     retry_count: int = 0,
 ) -> dict[str, Any]:
     result = http_json("POST", url, chat_payload(prompt, max_tokens=completion_budget), timeout=timeout)
-    prompt_tokens, prompt_count_source = count_prompt_tokens(preset, prompt, timeout=min(timeout, DEFAULT_TIMEOUT))
     completion_tokens = None
     parse_error = ""
     if result.ok:
@@ -696,11 +845,24 @@ def run_stress_request(
     if isinstance(usage.get("prompt_tokens"), int):
         prompt_tokens = usage["prompt_tokens"]
         prompt_count_source = "usage"
+    else:
+        # Only round-trip the prompt to /tokenize when the response didn't report usage.
+        prompt_tokens, prompt_count_source = count_prompt_tokens(preset, prompt, timeout=min(timeout, DEFAULT_TIMEOUT))
     if isinstance(usage.get("completion_tokens"), int):
         completion_tokens = usage["completion_tokens"]
+    timings = result.data.get("timings") if result.ok and isinstance(result.data, dict) and isinstance(result.data.get("timings"), dict) else {}
+
+    def _timing(key: str) -> float | None:
+        value = timings.get(key)
+        return float(value) if isinstance(value, (int, float)) and value > 0 else None
+
+    ttft_ms = _timing("prompt_ms")
+    prefill_tps = _timing("prompt_per_second")
+    generation_tps = _timing("predicted_per_second")
     active = prompt_tokens + (completion_tokens or 0)
     latency = result.elapsed_ms / 1000 if result.elapsed_ms else None
-    generation_tps = (completion_tokens / latency) if completion_tokens and latency and latency > 0 else None
+    if generation_tps is None:
+        generation_tps = (completion_tokens / latency) if completion_tokens and latency and latency > 0 else None
     return {
         "stage_percentage": stage_percent,
         "turn_number": turn,
@@ -713,8 +875,8 @@ def run_stress_request(
         "requested_completion_budget": completion_budget,
         "estimated_active_context_tokens": active,
         "estimated_active_context_percentage": round((active / effective_context) * 100, 2) if effective_context else None,
-        "TTFT": None,
-        "prefill_tokens_per_sec": None,
+        "TTFT": round(ttft_ms, 2) if ttft_ms is not None else None,
+        "prefill_tokens_per_sec": round(prefill_tps, 2) if prefill_tps is not None else None,
         "generation_tokens_per_sec": round(generation_tps, 2) if generation_tps else None,
         "total_latency": round(result.elapsed_ms, 2),
         "success": result.ok and not parse_error,
@@ -777,46 +939,85 @@ def context_stress_report(
     boundary_percents: tuple[int, ...] = STRESS_BOUNDARY_PERCENTS,
     agent_turns: int = STRESS_AGENT_TURNS,
     random_seed: int = STRESS_AGENT_SEED,
+    on_line: Any = None,
+    cancel: Any = None,
 ) -> tuple[bool, list[str]]:
+    sink = LineSink(on_line)
     detection = detect_runtime_context(preset)
     context = detection.get("effective_context")
     if not context:
-        return False, [
+        sink.extend([
             f"Stress: {preset.get('preset_name', '(unsaved)')}",
             "[FAIL] effective runtime context unavailable",
             f"Detection source: {detection.get('source')} confidence: {detection.get('confidence')}",
             "Stress result: FAIL",
-        ]
+        ])
+        return False, sink.lines
     context = int(context)
     output_tokens = max(32, min(max_output_tokens, max(32, context // 5)))
     host, port = preset_endpoint(preset)
-    lines = [
+    sink.extend([
         f"Stress: {preset.get('preset_name', '(unsaved)')}",
         f"Effective runtime context: {context} ({detection.get('confidence')} via {detection.get('source')})",
         f"Advertised model context: {detection.get('advertised_context')}",
         f"Current active context: {detection.get('current_active_context')}",
-    ]
+    ])
     url = endpoint_url(host, port, "/v1/chat/completions")
     records: list[dict[str, Any]] = []
 
-    lines.append("Mode: Fill and decode")
+    # Adaptive timeout: once we've observed how fast this server prefills,
+    # scale each request's timeout to the prompt size instead of failing big
+    # prompts on slow hardware with a fixed cutoff.
+    observed_prefill_tps: float | None = None
+
+    def request_timeout(target_tokens: int) -> float:
+        if observed_prefill_tps and observed_prefill_tps > 0:
+            return max(timeout, target_tokens / observed_prefill_tps * 2.5 + 30.0)
+        return timeout
+
+    def update_speed(record: dict[str, Any]) -> None:
+        nonlocal observed_prefill_tps
+        if not record.get("success"):
+            return
+        tps = record.get("prefill_tokens_per_sec")
+        if not tps:
+            latency_s = (record.get("total_latency") or 0) / 1000
+            prompt_tokens = record.get("prompt_tokens") or 0
+            if latency_s > 0 and prompt_tokens > 0:
+                tps = prompt_tokens / latency_s  # conservative: includes decode time
+        if tps:
+            observed_prefill_tps = tps if observed_prefill_tps is None else (observed_prefill_tps + tps) / 2
+
+    def cancelled() -> bool:
+        if cancel_requested(cancel):
+            sink.add("Stress cancelled by user.")
+            sink.add("Stress result: CANCELLED")
+            return True
+        return False
+
+    sink.add("Mode: Fill and decode")
     for percent in stage_percents:
+        if cancelled():
+            return False, sink.lines
         completion_budget = min(output_tokens, max(32, int(context * STRESS_OUTPUT_RESERVE_PERCENT / 100)))
         target = stress_stage_prompt_tokens(context, percent, completion_budget)
         prompt = build_context_stress_prompt(min(target, max_prompt_tokens))
         record = run_stress_request(
             preset, url, prompt, completion_budget,
-            timeout=timeout, stage_percent=percent, turn=None,
+            timeout=request_timeout(target), stage_percent=percent, turn=None,
             effective_context=context, detection=detection,
         )
         records.append(record)
-        lines.append(format_stress_record(record, "fill/decode"))
+        update_speed(record)
+        sink.add(format_stress_record(record, "fill/decode"))
 
-    lines.append("Mode: Sustained agent")
+    sink.add("Mode: Sustained agent")
     rng = random.Random(random_seed)
     history_parts: list[str] = []
     active_words = 0
     for turn in range(1, agent_turns + 1):
+        if cancelled():
+            return False, sink.lines
         add_percent = rng.uniform(1.5, 6.0)
         output_percent = rng.uniform(0.3, 1.5)
         if rng.random() < 0.12:
@@ -834,30 +1035,34 @@ def context_stress_report(
         prompt = "\n\n".join(history_parts)
         record = run_stress_request(
             preset, url, prompt, completion_budget,
-            timeout=timeout, stage_percent=None, turn=turn,
+            timeout=request_timeout(active_words), stage_percent=None, turn=turn,
             effective_context=context, detection=detection,
         )
         record["compacted"] = compacted
         records.append(record)
-        lines.append(format_stress_record(record, "sustained-agent"))
+        update_speed(record)
+        sink.add(format_stress_record(record, "sustained-agent"))
 
-    lines.append("Mode: Boundary probe")
+    sink.add("Mode: Boundary probe")
     for percent in boundary_percents:
+        if cancelled():
+            return False, sink.lines
         completion_budget = min(output_tokens, max(32, int(context * STRESS_OUTPUT_RESERVE_PERCENT / 100)))
         target = stress_stage_prompt_tokens(context, percent, completion_budget)
         prompt = build_context_stress_prompt(min(target, max_prompt_tokens))
         record = run_stress_request(
             preset, url, prompt, completion_budget,
-            timeout=timeout, stage_percent=percent, turn=None,
+            timeout=request_timeout(target), stage_percent=percent, turn=None,
             effective_context=context, detection=detection,
         )
         records.append(record)
-        lines.append(format_stress_record(record, "boundary"))
+        update_speed(record)
+        sink.add(format_stress_record(record, "boundary"))
 
-    lines.extend(summarize_stress(records, context))
+    sink.extend(summarize_stress(records, context))
     ok = any(record.get("success") for record in records)
-    lines.append(f"Stress result: {'PASS' if ok else 'FAIL'}")
-    return ok, lines
+    sink.add(f"Stress result: {'PASS' if ok else 'FAIL'}")
+    return ok, sink.lines
 
 
 def parse_chat_response(data: Any) -> tuple[str, int | None]:
@@ -889,52 +1094,52 @@ def probe_endpoint(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT) 
     return http_json("POST", endpoint_url(host, port, "/v1/chat/completions"), chat_payload("Say OK.", max_tokens=8), timeout)
 
 
-def doctor_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT) -> tuple[bool, list[str]]:
-    lines: list[str] = []
+def doctor_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT, on_line: Any = None) -> tuple[bool, list[str]]:
+    sink = LineSink(on_line)
     ok = True
     name = preset.get("preset_name", "(unsaved)")
-    lines.append(f"Doctor: {name}")
+    sink.add(f"Doctor: {name}")
 
     executable = preset.get("inferer_executable", "llama-server")
     exe_ok = executable_exists(executable)
-    lines.append(f"[{'PASS' if exe_ok else 'FAIL'}] executable: {executable}")
+    sink.add(f"[{'PASS' if exe_ok else 'FAIL'}] executable: {executable}")
     ok = ok and exe_ok
 
     for label, key in (("model", "model_path"), ("mmproj", "mmproj_path"), ("draft model", "draft_model_path")):
         value = (preset.get(key) or "").strip()
         if not value:
             if key == "model_path":
-                lines.append(f"[FAIL] {label}: not set")
+                sink.add(f"[FAIL] {label}: not set")
                 ok = False
             else:
-                lines.append(f"[SKIP] {label}: not set")
+                sink.add(f"[SKIP] {label}: not set")
             continue
         exists = Path(value).expanduser().exists()
-        lines.append(f"[{'PASS' if exists else 'FAIL'}] {label}: {value}")
+        sink.add(f"[{'PASS' if exists else 'FAIL'}] {label}: {value}")
         ok = ok and exists
 
     host, port = preset_endpoint(preset)
     listening = port_is_listening(host, port)
-    lines.append(f"[{'PASS' if listening else 'WARN'}] port: {host}:{port} is {'listening' if listening else 'not accepting connections'}")
+    sink.add(f"[{'PASS' if listening else 'WARN'}] port: {host}:{port} is {'listening' if listening else 'not accepting connections'}")
 
     for path in ("/health", "/v1/models"):
         result = http_json("GET", endpoint_url(host, port, path), timeout=timeout)
-        lines.append(format_endpoint_line(path, result))
+        sink.add(format_endpoint_line(path, result))
         ok = ok and result.ok
 
     probe = probe_endpoint(preset, timeout=timeout)
-    lines.append(format_endpoint_line("/v1/chat/completions", probe))
+    sink.add(format_endpoint_line("/v1/chat/completions", probe))
     if probe.ok:
         try:
             content, tokens = parse_chat_response(probe.data)
             detail = f"{tokens} token estimate" if tokens is not None else "no token count"
-            lines.append(f"[PASS] chat response parsed: {detail}; {content[:80]!r}")
+            sink.add(f"[PASS] chat response parsed: {detail}; {content[:80]!r}")
         except ValueError as exc:
-            lines.append(f"[FAIL] chat response parsed: {exc}")
+            sink.add(f"[FAIL] chat response parsed: {exc}")
             ok = False
     ok = ok and probe.ok
-    lines.append(f"Doctor result: {'PASS' if ok else 'FAIL'}")
-    return ok, lines
+    sink.add(f"Doctor result: {'PASS' if ok else 'FAIL'}")
+    return ok, sink.lines
 
 
 def format_endpoint_line(label: str, result: EndpointResult) -> str:
@@ -945,81 +1150,227 @@ def format_endpoint_line(label: str, result: EndpointResult) -> str:
     return f"[FAIL] {label}: {status}{detail}"
 
 
-def probe_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT) -> tuple[bool, list[str]]:
+def probe_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT, on_line: Any = None) -> tuple[bool, list[str]]:
+    sink = LineSink(on_line)
     result = probe_endpoint(preset, timeout=timeout)
-    lines = [f"Probe: {preset.get('preset_name', '(unsaved)')}", format_endpoint_line("/v1/chat/completions", result)]
+    sink.add(f"Probe: {preset.get('preset_name', '(unsaved)')}")
+    sink.add(format_endpoint_line("/v1/chat/completions", result))
     if not result.ok:
-        lines.append("Probe result: FAIL")
-        return False, lines
+        sink.add("Probe result: FAIL")
+        return False, sink.lines
     try:
         content, tokens = parse_chat_response(result.data)
     except ValueError as exc:
-        lines.append(f"[FAIL] response parsed: {exc}")
-        lines.append("Probe result: FAIL")
-        return False, lines
+        sink.add(f"[FAIL] response parsed: {exc}")
+        sink.add("Probe result: FAIL")
+        return False, sink.lines
     token_text = f"{tokens} token estimate" if tokens is not None else "no token count"
-    lines.append(f"[PASS] response parsed: {token_text}; {content[:120]!r}")
-    lines.append("Probe result: PASS")
-    return True, lines
+    sink.add(f"[PASS] response parsed: {token_text}; {content[:120]!r}")
+    sink.add("Probe result: PASS")
+    return True, sink.lines
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def http_stream_chat(url: str, payload: dict[str, Any], timeout: float = BENCH_TIMEOUT) -> dict[str, Any]:
+    """POST a streaming chat completion and measure time-to-first-token and total time.
+
+    Returns a dict with ok/status/error/ttft_ms/total_ms/tokens/content/timings/usage.
+    `timings` is llama-server's timing object when the final chunk carries one."""
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
+        method="POST",
+    )
+    out: dict[str, Any] = {
+        "ok": False, "status": None, "error": "", "ttft_ms": None,
+        "total_ms": 0.0, "tokens": 0, "content": "", "timings": {}, "usage": {},
+    }
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            out["status"] = response.status
+            content_parts: list[str] = []
+            for raw in response:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data_text = line[5:].strip()
+                if data_text == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(chunk.get("timings"), dict):
+                    out["timings"] = chunk["timings"]
+                if isinstance(chunk.get("usage"), dict):
+                    out["usage"] = chunk["usage"]
+                choices = chunk.get("choices") or []
+                delta = choices[0].get("delta") if choices and isinstance(choices[0], dict) else None
+                piece = str(delta.get("content") or "") if isinstance(delta, dict) else ""
+                if piece:
+                    if out["ttft_ms"] is None:
+                        out["ttft_ms"] = (time.perf_counter() - started) * 1000
+                    out["tokens"] += 1
+                    content_parts.append(piece)
+            out["content"] = "".join(content_parts)
+            out["total_ms"] = (time.perf_counter() - started) * 1000
+            out["ok"] = 200 <= (response.status or 0) < 300 and (out["tokens"] > 0 or bool(out["usage"]))
+            if not out["ok"] and not out["error"]:
+                out["error"] = "no streamed content received"
+            return out
+    except urllib.error.HTTPError as exc:
+        out["total_ms"] = (time.perf_counter() - started) * 1000
+        out["status"] = exc.code
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        exc.close()
+        out["error"] = detail or str(exc.reason)
+        return out
+    except Exception as exc:
+        out["total_ms"] = (time.perf_counter() - started) * 1000
+        out["error"] = str(exc)
+        return out
 
 
 def run_benchmark(
     preset: dict[str, Any],
     *,
-    timeout: float = DEFAULT_TIMEOUT,
+    timeout: float = BENCH_TIMEOUT,
     out_dir: Path | None = None,
     csv_out: bool = False,
+    iterations: int = BENCH_ITERATIONS,
+    max_tokens: int = BENCH_MAX_TOKENS,
+    on_line: Any = None,
+    cancel: Any = None,
 ) -> tuple[dict[str, Any], list[Path], list[str]]:
+    """Warmup + N streamed iterations. Reports median TTFT, generation tok/s, and
+    prefill tok/s (from llama-server timings when available) instead of a single
+    request whose tok/s silently includes prefill latency."""
+    sink = LineSink(on_line)
     host, port = preset_endpoint(preset)
-    result = http_json(
-        "POST",
-        endpoint_url(host, port, "/v1/chat/completions"),
-        chat_payload(BENCH_PROMPT, max_tokens=32),
-        timeout=timeout,
-    )
+    url = endpoint_url(host, port, "/v1/chat/completions")
     row: dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "preset": preset.get("preset_name", "(unsaved)"),
         "host": host,
         "port": port,
-        "status": "pass" if result.ok else "fail",
-        "http_status": result.status,
-        "latency_ms": round(result.elapsed_ms, 2),
+        "status": "fail",
+        "http_status": None,
+        "latency_ms": None,
         "completion_tokens": None,
         "tokens_per_second": None,
-        "error": result.error,
+        "ttft_ms": None,
+        "prefill_tokens_per_second": None,
+        "generation_tokens_per_second": None,
+        "iterations": 0,
+        "error": "",
     }
-    lines = [f"Bench: {row['preset']}", format_endpoint_line("/v1/chat/completions", result)]
-    if result.ok:
-        try:
-            content, tokens = parse_chat_response(result.data)
-            row["completion_tokens"] = tokens
-            if tokens is not None and result.elapsed_ms > 0:
-                row["tokens_per_second"] = round(tokens / (result.elapsed_ms / 1000), 2)
-            row["response_preview"] = content[:200]
-            lines.append(format_benchmark_result(row))
-        except ValueError as exc:
-            row["status"] = "fail"
-            row["error"] = str(exc)
-            lines.append(f"[FAIL] response parsed: {exc}")
+    sink.add(f"Bench: {row['preset']}")
+
+    warmup = http_json("POST", url, chat_payload(BENCH_WARMUP_PROMPT, max_tokens=8), timeout=timeout)
+    sink.add(format_endpoint_line("warmup /v1/chat/completions", warmup))
+    if not warmup.ok:
+        row["error"] = warmup.error
+        row["http_status"] = warmup.status
+        sink.add("Benchmark request failed.")
+        saved_paths = save_benchmark_result(row, out_dir=out_dir, csv_out=csv_out)
+        sink.extend([f"saved: {path}" for path in saved_paths])
+        return row, saved_paths, sink.lines
+    row["http_status"] = warmup.status
+
+    def _timing(timings: dict[str, Any], key: str) -> float | None:
+        value = timings.get(key)
+        return float(value) if isinstance(value, (int, float)) and value > 0 else None
+
+    samples: list[dict[str, Any]] = []
+    last_content = ""
+    for iteration in range(1, max(1, iterations) + 1):
+        if cancel_requested(cancel):
+            sink.add("Bench cancelled by user.")
+            break
+        payload = chat_payload(BENCH_PROMPT, max_tokens=max_tokens)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        result = http_stream_chat(url, payload, timeout=timeout)
+        if not result["ok"]:
+            row["error"] = result["error"]
+            row["http_status"] = result["status"] or row["http_status"]
+            sink.add(f"[FAIL] iteration {iteration}: {result['error'] or 'HTTP ' + str(result['status'])}")
+            continue
+        usage = result["usage"]
+        timings = result["timings"]
+        tokens = usage.get("completion_tokens") if isinstance(usage.get("completion_tokens"), int) else result["tokens"]
+        ttft = _timing(timings, "prompt_ms") or result["ttft_ms"]
+        prefill_tps = _timing(timings, "prompt_per_second")
+        gen_tps = _timing(timings, "predicted_per_second")
+        if gen_tps is None and tokens and tokens > 1 and result["ttft_ms"] is not None:
+            gen_seconds = (result["total_ms"] - result["ttft_ms"]) / 1000
+            if gen_seconds > 0:
+                gen_tps = (tokens - 1) / gen_seconds
+        sample = {
+            "total_ms": result["total_ms"],
+            "tokens": tokens or 0,
+            "ttft_ms": ttft,
+            "prefill_tps": prefill_tps,
+            "gen_tps": gen_tps,
+        }
+        samples.append(sample)
+        last_content = result["content"] or last_content
+        ttft_text = f"TTFT {ttft:.0f} ms" if ttft is not None else "TTFT unknown"
+        gen_text = f", gen {gen_tps:.2f} tok/s" if gen_tps is not None else ""
+        prefill_text = f", prefill {prefill_tps:.0f} tok/s" if prefill_tps is not None else ""
+        sink.add(f"[PASS] iteration {iteration}: {ttft_text}{gen_text}{prefill_text} ({tokens} tokens in {result['total_ms']:.0f} ms)")
+
+    if samples:
+        row["status"] = "pass"
+        row["error"] = ""
+        row["iterations"] = len(samples)
+        row["latency_ms"] = round(_median([s["total_ms"] for s in samples]) or 0.0, 2)
+        row["completion_tokens"] = int(_median([float(s["tokens"]) for s in samples]) or 0)
+        ttfts = [s["ttft_ms"] for s in samples if s["ttft_ms"] is not None]
+        row["ttft_ms"] = round(_median(ttfts), 2) if ttfts else None
+        gen = [s["gen_tps"] for s in samples if s["gen_tps"] is not None]
+        row["generation_tokens_per_second"] = round(_median(gen), 2) if gen else None
+        row["tokens_per_second"] = row["generation_tokens_per_second"]
+        prefill = [s["prefill_tps"] for s in samples if s["prefill_tps"] is not None]
+        row["prefill_tokens_per_second"] = round(_median(prefill), 2) if prefill else None
+        row["response_preview"] = last_content[:200]
+        sink.add(format_benchmark_result(row))
     else:
-        lines.append("Benchmark request failed.")
+        sink.add("Benchmark request failed.")
 
     saved_paths = save_benchmark_result(row, out_dir=out_dir, csv_out=csv_out)
-    lines.extend(f"saved: {path}" for path in saved_paths)
-    return row, saved_paths, lines
+    sink.extend([f"saved: {path}" for path in saved_paths])
+    return row, saved_paths, sink.lines
 
 
 def format_benchmark_result(row: dict[str, Any]) -> str:
     tokens = row.get("completion_tokens")
-    speed = row.get("tokens_per_second")
-    token_text = f"{tokens} completion tokens" if tokens is not None else "no token count"
-    speed_text = f", {speed} tok/s" if speed is not None else ""
-    return f"[PASS] benchmark: {row.get('latency_ms')} ms, {token_text}{speed_text}"
+    speed = row.get("generation_tokens_per_second") or row.get("tokens_per_second")
+    token_text = f"{tokens} completion tokens (median)" if tokens is not None else "no token count"
+    speed_text = f", gen {speed} tok/s" if speed is not None else ""
+    ttft = row.get("ttft_ms")
+    ttft_text = f", TTFT {ttft} ms" if ttft is not None else ""
+    prefill = row.get("prefill_tokens_per_second")
+    prefill_text = f", prefill {prefill} tok/s" if prefill is not None else ""
+    iterations = row.get("iterations")
+    iter_text = f" over {iterations} iterations" if iterations else ""
+    return f"[PASS] benchmark{iter_text}: {row.get('latency_ms')} ms{ttft_text}{speed_text}{prefill_text}, {token_text}"
 
 
 def save_benchmark_result(row: dict[str, Any], *, out_dir: Path | None = None, csv_out: bool = False) -> list[Path]:
-    base = out_dir or (APP_DIR / LOCAL_DATA_DIR / BENCHMARK_DIR)
+    base = out_dir or (default_data_dir() / BENCHMARK_DIR)
     base.mkdir(parents=True, exist_ok=True)
     safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(row.get("preset", "preset"))).strip("-") or "preset"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
