@@ -44,6 +44,47 @@ SIZE_RE = r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)"
 LONG_FLAG_RE = re.compile(r"(?<![\w-])(--[a-z][a-z0-9-]*)(?![\w-])")
 _SERVER_FLAG_CACHE: dict[tuple[tuple[str, ...], str], tuple[str, ...]] = {}
 
+# Bundled fallback for autocomplete when the selected server cannot be queried.
+KNOWN_LLAMA_FLAGS: tuple[str, ...] = (
+    "--no-webui", "--embedding", "--log-file", "--log-format", "--log-level",
+    "--log-colors", "--cont-batching", "--slot-save-file", "--listen",
+    "--ssl-file-key", "--ssl-file-cert", "--api-key", "--slots",
+    "--endpoint", "--endpoint-file",
+    "--chat-template", "--chat-template-kwargs", "--jinja", "--jinja++",
+    "--grp-attn-n", "--grp-attn-w", "--rope-scaling", "--rope-freq-base",
+    "--rope-freq-scale", "--rope-scaling-type", "--rope-freq-scale-policy",
+    "--rope-freq-scale-fill", "--yarn-orig-ctx", "--yarn-ext-factor",
+    "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow",
+    "--load-mode", "--numa", "--tensor-split", "--main-gpu",
+    "--split-mode", "--device", "--fit", "--fit-target", "--fit-ctx",
+    "--samplers", "--sparams", "--temp", "--top-k", "--top-p",
+    "--min-p", "--xtc-probability", "--xtc-threshold", "--typical-p",
+    "--repeat-last-n", "--repeat-penalty", "--frequency-penalty",
+    "--presence-penalty", "--dry-multiplier", "--dry-base",
+    "--dry-allowed-length", "--dry-penalty-last-n",
+    "--mirostat", "--mirostat-lr", "--mirostat-ent",
+    "--dynatemp-range", "--dynatemp-exp",
+    "--seed", "--prompt-cache", "--prompt-cache-all",
+    "--prompt-cache-ro", "--keep", "--batch-seq-len",
+    "--gen-sec", "--n-predict", "--predict",
+    "--ignore-eos", "--interactive", "--interactive-first",
+    "--in-prefix", "--in-suffix", "--reverse-prompt",
+    "--speculative-ngram", "--spec-type", "--spec-draft-n-max",
+    "--spec-draft-p-min", "--draft", "--model-draft",
+    "--multiline-input", "--simple-io", "--cb-style",
+    "--verbose", "--no-display-prompt",
+    "--prio", "--prio-pointer-fp16",
+    "--offload-kqv", "--no-kqv-offload",
+    "--memory-f32", "--memory-float",
+    "--ctx-evict", "--cache-reuse",
+    "--dont-evict",
+    "--spm", "--grammar", "--grammar-file",
+    "--ppl-output-token-prob",
+    "--check-tensors", "--override-kv",
+    "--lora", "--lora-base",
+    "--control-vector", "--control-vector-scaled-cn",
+)
+
 
 ALIAS_TO_FLAG = {
     "--model": "-m",
@@ -1156,7 +1197,14 @@ def probe_endpoint(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT) 
     return http_json("POST", endpoint_url(host, port, "/v1/chat/completions"), chat_payload("Say OK.", max_tokens=8), timeout)
 
 
-def doctor_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT, on_line: Any = None) -> tuple[bool, list[str]]:
+def doctor_report(
+    preset: dict[str, Any],
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    include_agent: bool = False,
+    agent_timeout: float = AGENT_TIMEOUT,
+    on_line: Any = None,
+) -> tuple[bool, list[str]]:
     sink = LineSink(on_line)
     ok = True
     name = preset.get("preset_name", "(unsaved)")
@@ -1200,6 +1248,12 @@ def doctor_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT, o
             sink.add(f"[FAIL] chat response parsed: {exc}")
             ok = False
     ok = ok and probe.ok
+    if include_agent:
+        agent_ok, agent_lines = agent_report(preset, timeout=agent_timeout)
+        sink.extend(agent_lines)
+        ok = ok and agent_ok
+    else:
+        sink.add("[SKIP] coding-agent usability: run Doctor with agent checks enabled")
     sink.add(f"Doctor result: {'PASS' if ok else 'FAIL'}")
     return ok, sink.lines
 
@@ -1241,7 +1295,7 @@ def model_id_from_response(data: Any) -> str:
     return "local-model"
 
 
-def parse_tool_call_response(data: Any) -> tuple[str, Any]:
+def parse_tool_call_response(data: Any) -> tuple[str, dict[str, Any]]:
     if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
         raise ValueError("missing choices")
     first = data["choices"][0]
@@ -1258,8 +1312,10 @@ def parse_tool_call_response(data: Any) -> tuple[str, Any]:
     if isinstance(arguments, str):
         try:
             arguments = json.loads(arguments)
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as exc:
+            raise ValueError("tool arguments are not valid JSON") from exc
+    if not isinstance(arguments, dict):
+        raise ValueError("tool arguments must be a JSON object")
     return str(function["name"]).strip(), arguments
 
 
@@ -1332,6 +1388,9 @@ def agent_report(preset: dict[str, Any], *, timeout: float = AGENT_TIMEOUT, on_l
             actual_name, arguments = parse_tool_call_response(tool_result.data)
             if actual_name != tool_name:
                 raise ValueError(f"expected {tool_name}, received {actual_name}")
+            timezone = arguments.get("timezone")
+            if not isinstance(timezone, str) or not timezone.strip():
+                raise ValueError("tool call is missing required timezone argument")
             sink.add(f"[PASS] tool call parsed: {actual_name} {arguments!r}")
         except ValueError as exc:
             sink.add(f"[FAIL] tool call parsed: {exc}")

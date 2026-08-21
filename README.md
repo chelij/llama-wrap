@@ -335,13 +335,13 @@ Calibration is intentionally conservative: implausibly tiny process readings are
 
 The GUI Diagnostics row runs these actions in the background and streams readable output into the existing log panel:
 
-- **Doctor**: checks executable/path setup, configured host/port, port availability, `/health`, `/v1/models`, and `/v1/chat/completions`.
+- **Doctor**: checks executable/path setup, configured host/port, port availability, `/health`, `/v1/models`, `/v1/chat/completions`, and coding-agent usability through the Agent capability and tool-call checks.
 - **Probe**: sends one small OpenAI-compatible chat completion request.
 - **Agent**: reports chat-template capabilities, probes the optional `/v1/responses` API, and requires the model to return a valid OpenAI-style function tool call.
 - **Bench**: sends one controlled prompt, reports latency/token speed when available, and saves a JSON result locally.
 - **Stress**: detects effective runtime context, runs staged fill/decode requests, sustained synthetic coding-agent turns, boundary probes, and prints a practical working-limit summary.
 
-The CLI exposes the same diagnostics through `doctor`, `probe`, `bench`, and `stress`.
+The CLI exposes the same diagnostics through `doctor`, `probe`, `agent`, `bench`, and `stress`. Use `doctor <preset> --agent` to include the optional coding-agent checks in the full Doctor report; `agent <preset>` runs those checks alone.
 
 Example diagnostic output:
 

@@ -14,6 +14,7 @@ Usage:
     llamawrap-cli rmflag <name> <flag>
     llamawrap-cli rename <name> <new-name>
     llamawrap-cli run <name>
+    llamawrap-cli doctor <name> [--agent]
     llamawrap-cli agent <name>
     llamawrap-cli delete <name>
 """
@@ -949,9 +950,9 @@ def _require_preset(data: dict, name: str) -> dict:
     return preset
 
 
-def cmd_doctor(data: dict, name: str) -> None:
+def cmd_doctor(data: dict, name: str, *, include_agent: bool = False) -> None:
     preset = _require_preset(data, name)
-    ok, lines = core.doctor_report(preset)
+    ok, lines = core.doctor_report(preset, include_agent=include_agent)
     print_diagnostic_lines(lines)
     if not ok:
         sys.exit(1)
@@ -1067,7 +1068,7 @@ HELP_TEXT = """Commands:
   list                        List all presets.
   create  <name> <model>      Create a preset from a model path.
   import  <name> <command>    Import a pasted launch command as a preset.
-  doctor  <name>              Check executable, paths, port, and API endpoints.
+  doctor  <name> [--agent]    Check setup/API endpoints; optionally test agent usability.
   probe   <name>              Send one OpenAI-compatible chat request.
   agent   <name>              Test API capabilities and a required tool call.
   bench   <name>              Run repeatable streamed benchmarks and save results.
@@ -1096,7 +1097,7 @@ HELP_DETAIL = {
     "list": "list\n    List all saved presets with their model file names.",
     "create": "create <preset-name> <model-path> [options]\n    Create a new preset. Creates history.json if it does not exist.\n\n    Options:\n      --executable <path-or-command>   Server executable (default: llama-server)\n      --inferer <name>                 Inferer label (default: llama.cpp)\n      --mmproj <path>                  MMProj model path and enabled --mmproj flag\n      --draft-model <path>             Draft/speculative model path\n      --extra-args <args>              Extra server args, quoted as one value\n      --set <flag> <value>             Set and enable a valued flag; repeatable\n      --toggle <flag>                  Enable a toggle flag; repeatable\n      --force                          Replace an existing preset with same name\n\n    Example:\n      llamawrap-cli create \"My Model\" /models/model.gguf --set -ngl all --set -c 32768 --set --port 8080",
     "import": "import <preset-name> <command-or-args...> [--force]\n    Import a llama-server command or launch args as a preset. Recognized\n    flags are stored as normal preset fields; unknown flags are preserved.\n\n    Examples:\n      llamawrap-cli import \"My Model\" llama-server -m /models/model.gguf -ngl all -c 32768\n      llamawrap-cli import \"Args Only\" -m /models/model.gguf --port 8080",
-    "doctor": "doctor <preset-name>\n    Check the preset executable, model paths, configured host/port,\n    /health, /v1/models, and /v1/chat/completions.",
+    "doctor": "doctor <preset-name> [--agent]\n    Check the preset executable, model paths, configured host/port,\n    /health, /v1/models, and /v1/chat/completions. --agent also runs\n    capability and required tool-call checks for coding-agent usability.",
     "probe": "probe <preset-name>\n    Send one small OpenAI-compatible /v1/chat/completions request to the\n    configured running endpoint and print pass/fail details.",
     "agent": "agent <preset-name>\n    Inspect llama.cpp chat-template capabilities, probe /v1/responses, and\n    require the model to return a valid OpenAI-style function tool call.\n    The Responses API is optional; correct tool-call behavior determines pass/fail.",
     "bench": "bench <preset-name> [--csv] [--out-dir <dir>]\n    Run a warmup plus several streamed benchmark iterations against the\n    configured running endpoint, reporting median TTFT, generation tok/s,\n    and prefill tok/s when the server provides timings. JSON results are\n    saved under the llama-wrap data directory by default (a portable\n    .llama-wrap folder next to the app is used when present).\n    --csv saves a CSV copy too.",
@@ -1311,7 +1312,7 @@ def interactive_flag_editor(preset: dict, history_path: Path, data: dict) -> Non
     print(f"\n── Flags: {name} ──")
     # Set up tab completion
     executable = str(preset.get("inferer_executable") or "llama-server")
-    discovered = core.discover_server_flags(executable)
+    discovered = core.discover_server_flags(executable, core.KNOWN_LLAMA_FLAGS)
     flag_names = sorted(set(preset.get("flags", {}).keys()) | set(discovered))
     old_completer = readline.get_completer() if readline is not None else None
     old_delims = readline.get_completer_delims() if readline is not None else None
@@ -1459,8 +1460,11 @@ def main() -> None:
 
     elif cmd == "doctor":
         if len(args) < 2:
-            error("usage: llamawrap-cli doctor <preset-name>")
-        cmd_doctor(data, args[1])
+            error("usage: llamawrap-cli doctor <preset-name> [--agent]")
+        extra = args[2:]
+        if any(value != "--agent" for value in extra) or extra.count("--agent") > 1:
+            error("usage: llamawrap-cli doctor <preset-name> [--agent]")
+        cmd_doctor(data, args[1], include_agent="--agent" in extra)
 
     elif cmd == "probe":
         if len(args) < 2:

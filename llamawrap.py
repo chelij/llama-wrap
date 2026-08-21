@@ -55,48 +55,7 @@ def _default_history_file() -> Path:
 
 HISTORY_FILE = _default_history_file()
 
-# Known llama-server flags for the "Add flag" suggestion dropdown.
-# These are NOT a hardcoded UI — they only appear as autocomplete hints
-# when a user clicks + to add a custom flag.
-KNOWN_LLAMA_FLAGS: tuple[str, ...] = (
-    "--no-webui", "--embedding", "--log-file", "--log-format", "--log-level",
-    "--log-colors", "--cont-batching", "--slot-save-file", "--listen",
-    "--ssl-file-key", "--ssl-file-cert", "--api-key", "--slots",
-    "--endpoint", "--endpoint-file",
-    "--chat-template", "--chat-template-kwargs", "--jinja", "--jinja++",
-    "--grp-attn-n", "--grp-attn-w", "--rope-scaling", "--rope-freq-base",
-    "--rope-freq-scale", "--rope-scaling-type", "--rope-freq-scale-policy",
-    "--rope-freq-scale-fill", "--yarn-orig-ctx", "--yarn-ext-factor",
-    "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow",
-    "--load-mode", "--numa", "--tensor-split", "--main-gpu",
-    "--split-mode", "--device", "--fit", "--fit-target", "--fit-ctx",
-    "--samplers", "--sparams", "--temp", "--top-k", "--top-p",
-    "--min-p", "--xtc-probability", "--xtc-threshold", "--typical-p",
-    "--repeat-last-n", "--repeat-penalty", "--frequency-penalty",
-    "--presence-penalty", "--dry-multiplier", "--dry-base",
-    "--dry-allowed-length", "--dry-penalty-last-n",
-    "--mirostat", "--mirostat-lr", "--mirostat-ent",
-    "--dynatemp-range", "--dynatemp-exp",
-    "--seed", "--prompt-cache", "--prompt-cache-all",
-    "--prompt-cache-ro", "--keep", "--batch-seq-len",
-    "--gen-sec", "--n-predict", "--predict",
-    "--ignore-eos", "--interactive", "--interactive-first",
-    "--in-prefix", "--in-suffix", "--reverse-prompt",
-    "--speculative-ngram", "--spec-type", "--spec-draft-n-max",
-    "--spec-draft-p-min", "--draft", "--model-draft",
-    "--multiline-input", "--simple-io", "--cb-style",
-    "--verbose", "--no-display-prompt",
-    "--prio", "--prio-pointer-fp16",
-    "--offload-kqv", "--no-kqv-offload",
-    "--memory-f32", "--memory-float",
-    "--ctx-evict", "--cache-reuse",
-    "--dont-evict",
-    "--spm", "--grammar", "--grammar-file",
-    "--ppl-output-token-prob",
-    "--check-tensors", "--override-kv",
-    "--lora", "--lora-base",
-    "--control-vector", "--control-vector-scaled-cn",
-)
+KNOWN_LLAMA_FLAGS = core.KNOWN_LLAMA_FLAGS
 KV_BYTES = {
     "f32": 4.0,
     "f16": 2.0,
@@ -1109,7 +1068,7 @@ class LauncherApp:
             diagnostics_buttons.columnconfigure(col, weight=1, uniform="diagnostics_buttons")
         doctor_button = self.make_button(diagnostics_buttons, "Doctor", self.run_diagnostics_doctor, width=78, bg=self.colors["panel_soft"])
         doctor_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        Tooltip(doctor_button, "Doctor\n\nCheck executable, model paths, port, and OpenAI-compatible endpoints.")
+        Tooltip(doctor_button, "Doctor\n\nCheck setup, OpenAI-compatible endpoints, and coding-agent tool-call usability.")
         probe_button = self.make_button(diagnostics_buttons, "Probe", self.run_diagnostics_probe, width=78, bg=self.colors["panel_soft"])
         probe_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         Tooltip(probe_button, "Probe\n\nSend one small chat completion request to the configured endpoint.")
@@ -2583,7 +2542,12 @@ class LauncherApp:
             self.append_log("warn", "Cancelling diagnostics after the current request...")
 
     def run_diagnostics_doctor(self) -> None:
-        self._run_diagnostics_task("Doctor", lambda preset, on_line, _cancel: core.doctor_report(preset, on_line=on_line)[0])
+        self._run_diagnostics_task(
+            "Doctor",
+            lambda preset, on_line, _cancel: core.doctor_report(
+                preset, include_agent=True, on_line=on_line,
+            )[0],
+        )
 
     def run_diagnostics_probe(self) -> None:
         self._run_diagnostics_task("Probe", lambda preset, on_line, _cancel: core.probe_report(preset, on_line=on_line)[0])

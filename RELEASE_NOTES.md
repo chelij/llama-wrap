@@ -5,7 +5,7 @@
 ### Added
 
 - Add Flag suggestions are discovered from the selected server's live `--help` output and cached by command/version, with the bundled list retained as a fallback.
-- New Agent diagnostic in the GUI and CLI reports chat-template capabilities, probes `/v1/responses`, and validates a required OpenAI-style function tool call.
+- Doctor can now include coding-agent usability checks; the GUI enables them by default and the CLI exposes them through `doctor <preset> --agent`. The focused Agent diagnostic remains available and reports chat-template capabilities, probes `/v1/responses`, and validates a required OpenAI-style function tool call and its arguments.
 
 ### Changed
 

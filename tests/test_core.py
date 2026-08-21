@@ -124,6 +124,13 @@ class CoreTests(unittest.TestCase):
             flags = core.discover_server_flags("missing-server", ("--zeta", "--alpha"))
         self.assertEqual(flags, ("--alpha", "--zeta"))
 
+    def test_bundled_flag_fallback_is_available_to_all_clients(self) -> None:
+        core._SERVER_FLAG_CACHE.clear()
+        with mock.patch("llamawrap_core.subprocess.run", side_effect=FileNotFoundError("missing")):
+            flags = core.discover_server_flags("missing-server", core.KNOWN_LLAMA_FLAGS)
+        self.assertIn("--fit", flags)
+        self.assertIn("--jinja", flags)
+
     def test_server_readiness_log_matching(self) -> None:
         for line in ("main: model loaded", "Server is listening on 127.0.0.1", "all slots are idle"):
             self.assertTrue(core.log_indicates_server_ready(line))
@@ -160,6 +167,38 @@ class CoreTests(unittest.TestCase):
             ok, lines = core.agent_report(make_preset())
         self.assertFalse(ok)
         self.assertTrue(any("model returned no tool_calls" in line for line in lines))
+
+    def test_parse_tool_call_rejects_invalid_json_arguments(self) -> None:
+        response = {"choices": [{"message": {"tool_calls": [{
+            "function": {"name": "llama_wrap_time_check", "arguments": "{not-json"},
+        }]}}]}
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            core.parse_tool_call_response(response)
+
+    def test_agent_report_rejects_missing_required_timezone(self) -> None:
+        def fake_http(
+            _method: str,
+            url: str,
+            _payload: dict | None = None,
+            timeout: float = 0,
+        ) -> core.EndpointResult:
+            del timeout
+            if url.endswith("/v1/models"):
+                return core.EndpointResult(True, 200, url, data={"data": [{"id": "demo"}]})
+            if url.endswith("/props"):
+                return core.EndpointResult(True, 200, url, data={"chat_template_caps": {"supports_tools": True}})
+            if url.endswith("/v1/responses"):
+                return core.EndpointResult(False, 404, url, error="not found")
+            return core.EndpointResult(True, 200, url, data={
+                "choices": [{"message": {"tool_calls": [{
+                    "function": {"name": "llama_wrap_time_check", "arguments": "{}"},
+                }]}}],
+            })
+
+        with mock.patch("llamawrap_core.http_json", side_effect=fake_http):
+            ok, lines = core.agent_report(make_preset())
+        self.assertFalse(ok)
+        self.assertTrue(any("missing required timezone" in line for line in lines))
 
     def test_http_json_success(self) -> None:
         with mock.patch("urllib.request.urlopen", return_value=FakeResponse(200, '{"ok": true}')):
@@ -660,6 +699,11 @@ class CliSmokeTests(unittest.TestCase):
             doctor = self.run_cli(history, "doctor", "Demo")
             self.assertEqual(doctor.returncode, 0, doctor.stderr + doctor.stdout)
             self.assertIn("Doctor result: PASS", doctor.stdout)
+
+            agent_doctor = self.run_cli(history, "doctor", "Demo", "--agent")
+            self.assertEqual(agent_doctor.returncode, 0, agent_doctor.stderr + agent_doctor.stdout)
+            self.assertIn("Agent result: PASS", agent_doctor.stdout)
+            self.assertIn("Doctor result: PASS", agent_doctor.stdout)
 
             probe = self.run_cli(history, "probe", "Demo")
             self.assertEqual(probe.returncode, 0, probe.stderr + probe.stdout)
