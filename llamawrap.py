@@ -68,8 +68,8 @@ KNOWN_LLAMA_FLAGS: tuple[str, ...] = (
     "--rope-freq-scale", "--rope-scaling-type", "--rope-freq-scale-policy",
     "--rope-freq-scale-fill", "--yarn-orig-ctx", "--yarn-ext-factor",
     "--yarn-attn-factor", "--yarn-beta-fast", "--yarn-beta-slow",
-    "--no-mmap", "--numa", "--tensor-split", "--main-gpu",
-    "--split-mode", "--gpu-device", "--mlock",
+    "--load-mode", "--numa", "--tensor-split", "--main-gpu",
+    "--split-mode", "--device", "--fit", "--fit-target", "--fit-ctx",
     "--samplers", "--sparams", "--temp", "--top-k", "--top-p",
     "--min-p", "--xtc-probability", "--xtc-threshold", "--typical-p",
     "--repeat-last-n", "--repeat-penalty", "--frequency-penalty",
@@ -659,7 +659,7 @@ class LauncherApp:
             # -- Server --
             "--port": FlagConfig("Port", str(DEFAULT_SERVER_PORT), False, group="Server"),
             "--host": FlagConfig("Host", "127.0.0.1", False, group="Server"),
-            "-np": FlagConfig("Parallel slots", "1", False, group="Server"),
+            "-np": FlagConfig("Parallel slots", "-1", False, group="Server"),
             "-a": FlagConfig("Alias", "", False, group="Server"),
             "-to": FlagConfig("Timeout", "600", False, group="Server"),
             # -- Batch --
@@ -706,7 +706,7 @@ class LauncherApp:
             "--spec-draft-n-min": "Minimum draft tokens before verification (default: 0).",
             "--spec-draft-p-min": "Min probability threshold for greedy draft acceptance (default: 0.75). Higher = stricter acceptance.",
             "-ngld": "GPU layers for the draft/MTP path (long form: --spec-draft-ngl). High value for full draft offload when VRAM allows.",
-            "--jinja": "Disable jinja chat template engine. Enabled by default; disable only for legacy clients that need raw model output.",
+            "--jinja": "Enable the Jinja chat template engine. Current llama.cpp builds enable it by default; use --no-jinja only for legacy clients that need raw model output.",
             "--fit": "Auto-fit layers to VRAM. 'on' (default) adjusts unset args to fit device memory; 'off' disables auto-fit. Set to 'off' when using explicit -ngl.",
             "--fit-margin": "ik_llama.cpp only. VRAM safety margin in MiB for --fit. Increase if model loading hits OOM. (Standard llama.cpp: use --fit-target instead.)",
             "-mla": "ik_llama.cpp only. MLA mode for DeepSeek-style Multi-Latent Attention models. Leave disabled unless the model/docs recommend it.",
@@ -1105,7 +1105,7 @@ class LauncherApp:
         )
         diagnostics_buttons = tk.Frame(diagnostics_panel, bg=self.colors["panel"])
         diagnostics_buttons.grid(row=0, column=1, sticky="ew")
-        for col in range(5):
+        for col in range(6):
             diagnostics_buttons.columnconfigure(col, weight=1, uniform="diagnostics_buttons")
         doctor_button = self.make_button(diagnostics_buttons, "Doctor", self.run_diagnostics_doctor, width=78, bg=self.colors["panel_soft"])
         doctor_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
@@ -1113,14 +1113,17 @@ class LauncherApp:
         probe_button = self.make_button(diagnostics_buttons, "Probe", self.run_diagnostics_probe, width=78, bg=self.colors["panel_soft"])
         probe_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         Tooltip(probe_button, "Probe\n\nSend one small chat completion request to the configured endpoint.")
+        agent_button = self.make_button(diagnostics_buttons, "Agent", self.run_diagnostics_agent, width=78, bg=self.colors["panel_soft"])
+        agent_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        Tooltip(agent_button, "Agent\n\nInspect template capabilities, test Responses API support, and require a real tool call.")
         bench_button = self.make_button(diagnostics_buttons, "Bench", self.run_diagnostics_bench, width=78, bg=self.colors["panel_soft"])
-        bench_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        bench_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
         Tooltip(bench_button, "Bench\n\nRun a warmup plus several streamed iterations and save median performance results locally.")
         stress_button = self.make_button(diagnostics_buttons, "Stress", self.run_diagnostics_stress, width=78, bg=self.colors["warn"])
-        stress_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        stress_button.grid(row=0, column=4, sticky="ew", padx=(0, 6))
         Tooltip(stress_button, "Stress\n\nSend a large prompt to fill most of the configured context window.")
         self.diag_cancel_button = self.make_button(diagnostics_buttons, "Cancel", self.cancel_diagnostics, width=78, bg=self.colors["panel_soft"])
-        self.diag_cancel_button.grid(row=0, column=4, sticky="ew")
+        self.diag_cancel_button.grid(row=0, column=5, sticky="ew")
         self.diag_cancel_button.configure(state="disabled")
         Tooltip(self.diag_cancel_button, "Cancel\n\nStop the running diagnostics task after the current request finishes.")
 
@@ -1471,6 +1474,22 @@ class LauncherApp:
             height=20,
         )
         flag_entry.grid(row=0, column=1, sticky="ew", pady=(0, 10), ipady=6)
+
+        executable = self.inferer_executable_var.get().strip() if self.inferer_executable_var else "llama-server"
+
+        def load_live_flag_suggestions() -> None:
+            suggestions = core.discover_server_flags(executable, KNOWN_LLAMA_FLAGS)
+
+            def apply_suggestions() -> None:
+                try:
+                    if dialog.winfo_exists():
+                        flag_entry.configure(values=suggestions)
+                except tk.TclError:
+                    pass
+
+            self.root.after(0, apply_suggestions)
+
+        threading.Thread(target=load_live_flag_suggestions, daemon=True).start()
 
         tk.Label(shell, text="Value", bg=self.colors["bg"], fg=self.colors["muted"], font=("TkDefaultFont", 10, "bold")).grid(
             row=1, column=0, sticky="w", padx=(0, 12), pady=(0, 10)
@@ -2569,6 +2588,9 @@ class LauncherApp:
     def run_diagnostics_probe(self) -> None:
         self._run_diagnostics_task("Probe", lambda preset, on_line, _cancel: core.probe_report(preset, on_line=on_line)[0])
 
+    def run_diagnostics_agent(self) -> None:
+        self._run_diagnostics_task("Agent", lambda preset, on_line, _cancel: core.agent_report(preset, on_line=on_line)[0])
+
     def run_diagnostics_bench(self) -> None:
         def worker(preset: dict[str, Any], on_line: Any, cancel: Any) -> bool:
             row, _paths, _lines = core.run_benchmark(preset, on_line=on_line, cancel=cancel)
@@ -3279,8 +3301,7 @@ class LauncherApp:
     def update_status_from_log(self, text: str) -> None:
         if self.model_loaded:
             return
-        lower = text.lower()
-        if "main: model loaded" in lower or "server is listening on" in lower or "all slots are idle" in lower:
+        if core.log_indicates_server_ready(text):
             self.model_loaded = True
             if self.process and self.process.poll() is None:
                 self.set_status("Running")

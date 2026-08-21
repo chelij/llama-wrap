@@ -14,6 +14,7 @@ Usage:
     llamawrap-cli rmflag <name> <flag>
     llamawrap-cli rename <name> <new-name>
     llamawrap-cli run <name>
+    llamawrap-cli agent <name>
     llamawrap-cli delete <name>
 """
 
@@ -130,11 +131,11 @@ def cyan(text: str) -> str:
 _STATUS_COLOR = {"PASS": green, "FAIL": red, "WARN": yellow, "SKIP": dim}
 _STATUS_LINE_RE = re.compile(r"^\[(PASS|FAIL|WARN|SKIP)\]\s*([^:]+):?\s*(.*)$")
 _RESULT_LINE_RE = re.compile(r"^(.+ result): (PASS|FAIL)$")
-_HEADER_LINE_RE = re.compile(r"^(Doctor|Probe|Bench|Stress): (.+)$")
+_HEADER_LINE_RE = re.compile(r"^(Doctor|Probe|Agent|Bench|Stress): (.+)$")
 
 
 def print_diagnostic_lines(lines: list[str]) -> None:
-    """Print Doctor/Probe/Bench/Stress report lines as an aligned, color-coded list.
+    """Print diagnostic report lines as an aligned, color-coded list.
 
     Falls back to printing the line unmodified when it doesn't match a
     recognized status/result/header shape, so unusual output is never lost.
@@ -964,6 +965,14 @@ def cmd_probe(data: dict, name: str) -> None:
         sys.exit(1)
 
 
+def cmd_agent(data: dict, name: str) -> None:
+    preset = _require_preset(data, name)
+    ok, lines = core.agent_report(preset)
+    print_diagnostic_lines(lines)
+    if not ok:
+        sys.exit(1)
+
+
 def cmd_bench(data: dict, args: list[str]) -> None:
     if len(args) < 2:
         error("usage: llamawrap-cli bench <preset-name> [--csv] [--out-dir <dir>]")
@@ -1060,6 +1069,7 @@ HELP_TEXT = """Commands:
   import  <name> <command>    Import a pasted launch command as a preset.
   doctor  <name>              Check executable, paths, port, and API endpoints.
   probe   <name>              Send one OpenAI-compatible chat request.
+  agent   <name>              Test API capabilities and a required tool call.
   bench   <name>              Run repeatable streamed benchmarks and save results.
   stress  <name>              Run the same context stress suite as the GUI.
   export-presets --out <file> Export presets to a portable JSON bundle.
@@ -1088,6 +1098,7 @@ HELP_DETAIL = {
     "import": "import <preset-name> <command-or-args...> [--force]\n    Import a llama-server command or launch args as a preset. Recognized\n    flags are stored as normal preset fields; unknown flags are preserved.\n\n    Examples:\n      llamawrap-cli import \"My Model\" llama-server -m /models/model.gguf -ngl all -c 32768\n      llamawrap-cli import \"Args Only\" -m /models/model.gguf --port 8080",
     "doctor": "doctor <preset-name>\n    Check the preset executable, model paths, configured host/port,\n    /health, /v1/models, and /v1/chat/completions.",
     "probe": "probe <preset-name>\n    Send one small OpenAI-compatible /v1/chat/completions request to the\n    configured running endpoint and print pass/fail details.",
+    "agent": "agent <preset-name>\n    Inspect llama.cpp chat-template capabilities, probe /v1/responses, and\n    require the model to return a valid OpenAI-style function tool call.\n    The Responses API is optional; correct tool-call behavior determines pass/fail.",
     "bench": "bench <preset-name> [--csv] [--out-dir <dir>]\n    Run a warmup plus several streamed benchmark iterations against the\n    configured running endpoint, reporting median TTFT, generation tok/s,\n    and prefill tok/s when the server provides timings. JSON results are\n    saved under the llama-wrap data directory by default (a portable\n    .llama-wrap folder next to the app is used when present).\n    --csv saves a CSV copy too.",
     "stress": "stress <preset-name>\n    Run the same percentage-based context stress suite as the GUI Stress\n    button: runtime context detection, fill/decode stages, sustained synthetic\n    coding-agent turns, boundary probes, error classification, and a practical\n    working-limit summary.",
     "export-presets": "export-presets --out <file> [--portable] [preset-name...]\n    Export all presets, or selected preset names, to a JSON bundle.\n    Absolute paths are preserved and reported as portability warnings.",
@@ -1299,7 +1310,9 @@ def interactive_flag_editor(preset: dict, history_path: Path, data: dict) -> Non
     name = preset.get("preset_name", "?")
     print(f"\n── Flags: {name} ──")
     # Set up tab completion
-    flag_names = sorted(preset.get("flags", {}).keys())
+    executable = str(preset.get("inferer_executable") or "llama-server")
+    discovered = core.discover_server_flags(executable)
+    flag_names = sorted(set(preset.get("flags", {}).keys()) | set(discovered))
     old_completer = readline.get_completer() if readline is not None else None
     old_delims = readline.get_completer_delims() if readline is not None else None
     if readline is not None:
@@ -1375,7 +1388,7 @@ def main() -> None:
         return
     if args[0] not in (
         "list", "create", "import", "show", "set", "enable", "disable",
-        "rmflag", "rename", "delete", "run", "doctor", "probe", "bench",
+        "rmflag", "rename", "delete", "run", "doctor", "probe", "agent", "bench",
         "stress", "export-presets", "import-presets", "help",
     ):
         print(f"unknown command: {args[0]}", file=sys.stderr)
@@ -1453,6 +1466,11 @@ def main() -> None:
         if len(args) < 2:
             error("usage: llamawrap-cli probe <preset-name>")
         cmd_probe(data, args[1])
+
+    elif cmd == "agent":
+        if len(args) < 2:
+            error("usage: llamawrap-cli agent <preset-name>")
+        cmd_agent(data, args[1])
 
     elif cmd == "bench":
         cmd_bench(data, args)

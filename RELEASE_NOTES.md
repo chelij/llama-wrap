@@ -1,5 +1,17 @@
 # Release Notes
 
+## Unreleased
+
+### Added
+
+- Add Flag suggestions are discovered from the selected server's live `--help` output and cached by command/version, with the bundled list retained as a fallback.
+- New Agent diagnostic in the GUI and CLI reports chat-template capabilities, probes `/v1/responses`, and validates a required OpenAI-style function tool call.
+
+### Changed
+
+- Server readiness recognizes current llama-server loading/listening log variants through shared, tested core logic.
+- The parallel-slots default now matches llama.cpp's `-1` automatic setting, and the Jinja help text correctly distinguishes `--jinja` from `--no-jinja`.
+
 ## v0.1.13 - 2026-07-02 - Reliability and Benchmarking Patch
 
 ### Added

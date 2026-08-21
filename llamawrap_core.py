@@ -26,6 +26,7 @@ BENCHMARK_DIR = "benchmarks"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_TIMEOUT = 5.0
+AGENT_TIMEOUT = 120.0
 BENCH_PROMPT = "Reply with one short sentence about local AI diagnostics."
 BENCH_WARMUP_PROMPT = "Warmup request. Reply with OK."
 BENCH_ITERATIONS = 3
@@ -40,6 +41,8 @@ STRESS_OUTPUT_RESERVE_PERCENT = 5
 STRESS_AGENT_TURNS = 40
 STRESS_AGENT_SEED = 1337
 SIZE_RE = r"([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)"
+LONG_FLAG_RE = re.compile(r"(?<![\w-])(--[a-z][a-z0-9-]*)(?![\w-])")
+_SERVER_FLAG_CACHE: dict[tuple[tuple[str, ...], str], tuple[str, ...]] = {}
 
 
 ALIAS_TO_FLAG = {
@@ -251,7 +254,7 @@ def default_cli_flags() -> dict[str, dict[str, Any]]:
         "-fmoe": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
         "--port": {"value": str(DEFAULT_PORT), "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
         "--host": {"value": DEFAULT_HOST, "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
-        "-np": {"value": "1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
+        "-np": {"value": "-1", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
         "-a": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
         "-to": {"value": "600", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
         "-b": {"value": "2048", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
@@ -265,6 +268,65 @@ def default_cli_flags() -> dict[str, dict[str, Any]]:
         "--jinja": {"value": "", "enabled": False, "value_required": False, "custom": False, "step_mode": ""},
         "--mmproj": {"value": "", "enabled": False, "value_required": True, "custom": False, "step_mode": ""},
     }
+
+
+def discover_server_flags(executable_text: str, fallback: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """Read long options from a server's current --help output.
+
+    Results are cached by the exact command and reported server version. The
+    caller-provided static list is returned when the executable cannot be
+    inspected, keeping custom and unavailable inferers usable.
+    """
+    try:
+        command = tuple(shlex.split(executable_text))
+    except ValueError:
+        return tuple(sorted(set(fallback)))
+    if not command:
+        return tuple(sorted(set(fallback)))
+
+    try:
+        version_process = subprocess.run(
+            [*command, "--version"],
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        version_output = f"{version_process.stdout}\n{version_process.stderr}"
+        version = next((line.strip() for line in version_output.splitlines() if line.strip()), "unknown")
+    except (OSError, subprocess.TimeoutExpired):
+        version = "unknown"
+
+    cache_key = (command, version)
+    cached = _SERVER_FLAG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        help_process = subprocess.run(
+            [*command, "--help"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        help_output = f"{help_process.stdout}\n{help_process.stderr}"
+    except (OSError, subprocess.TimeoutExpired):
+        return tuple(sorted(set(fallback)))
+
+    flags = tuple(sorted(set(LONG_FLAG_RE.findall(help_output))))
+    if not flags:
+        return tuple(sorted(set(fallback)))
+    _SERVER_FLAG_CACHE[cache_key] = flags
+    return flags
+
+
+def log_indicates_server_ready(text: str) -> bool:
+    lower = text.lower()
+    return any(
+        token in lower
+        for token in ("main: model loaded", "model loaded", "server is listening on", "listening on", "all slots are idle")
+    )
 
 
 NEGATIVE_NUMBER_RE = re.compile(r"^-\d+(?:\.\d+)?$")
@@ -1168,6 +1230,114 @@ def probe_report(preset: dict[str, Any], *, timeout: float = DEFAULT_TIMEOUT, on
     sink.add(f"[PASS] response parsed: {token_text}; {content[:120]!r}")
     sink.add("Probe result: PASS")
     return True, sink.lines
+
+
+def model_id_from_response(data: Any) -> str:
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        return "local-model"
+    for item in data["data"]:
+        if isinstance(item, dict) and str(item.get("id") or "").strip():
+            return str(item["id"]).strip()
+    return "local-model"
+
+
+def parse_tool_call_response(data: Any) -> tuple[str, Any]:
+    if not isinstance(data, dict) or not isinstance(data.get("choices"), list) or not data["choices"]:
+        raise ValueError("missing choices")
+    first = data["choices"][0]
+    if not isinstance(first, dict) or not isinstance(first.get("message"), dict):
+        raise ValueError("missing assistant message")
+    tool_calls = first["message"].get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise ValueError("model returned no tool_calls")
+    call = tool_calls[0]
+    function = call.get("function") if isinstance(call, dict) else None
+    if not isinstance(function, dict) or not str(function.get("name") or "").strip():
+        raise ValueError("tool call has no function name")
+    arguments: Any = function.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            pass
+    return str(function["name"]).strip(), arguments
+
+
+def agent_report(preset: dict[str, Any], *, timeout: float = AGENT_TIMEOUT, on_line: Any = None) -> tuple[bool, list[str]]:
+    """Check API and tool-call behavior needed by coding-agent clients."""
+    sink = LineSink(on_line)
+    sink.add(f"Agent: {preset.get('preset_name', '(unsaved)')}")
+    host, port = preset_endpoint(preset)
+
+    models = http_json("GET", endpoint_url(host, port, "/v1/models"), timeout=timeout)
+    model_id = model_id_from_response(models.data) if models.ok else "local-model"
+    sink.add(format_endpoint_line("/v1/models", models))
+
+    props = http_json("GET", endpoint_url(host, port, "/props"), timeout=timeout)
+    if props.ok and isinstance(props.data, dict):
+        caps = props.data.get("chat_template_caps")
+        if isinstance(caps, dict) and caps:
+            enabled = sorted(key for key, value in caps.items() if value is True)
+            disabled = sorted(key for key, value in caps.items() if value is False)
+            detail = f"enabled {', '.join(enabled) or 'none'}"
+            if disabled:
+                detail += f"; disabled {', '.join(disabled)}"
+            sink.add(f"[PASS] template capabilities: {detail}")
+        else:
+            sink.add("[WARN] template capabilities: /props returned no chat_template_caps")
+    else:
+        status = f"HTTP {props.status}" if props.status is not None else "unavailable"
+        sink.add(f"[WARN] template capabilities: {status}; runtime tool test will decide")
+
+    responses = http_json(
+        "POST",
+        endpoint_url(host, port, "/v1/responses"),
+        {"model": model_id, "input": "Reply with exactly OK.", "max_output_tokens": 8},
+        timeout,
+    )
+    if responses.ok:
+        sink.add(format_endpoint_line("/v1/responses", responses))
+    else:
+        status = f"HTTP {responses.status}" if responses.status is not None else "unavailable"
+        detail = f" ({responses.error})" if responses.error else ""
+        sink.add(f"[WARN] /v1/responses: {status}{detail}")
+
+    tool_name = "llama_wrap_time_check"
+    tool_payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": "Use llama_wrap_time_check for timezone UTC. Do not answer directly."}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": "Return the current time for a timezone.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"timezone": {"type": "string"}},
+                    "required": ["timezone"],
+                    "additionalProperties": False,
+                },
+            },
+        }],
+        "tool_choice": {"type": "function", "function": {"name": tool_name}},
+        "temperature": 0,
+        "max_tokens": 128,
+        "stream": False,
+    }
+    tool_result = http_json("POST", endpoint_url(host, port, "/v1/chat/completions"), tool_payload, timeout)
+    sink.add(format_endpoint_line("tool-call request", tool_result))
+    ok = models.ok and tool_result.ok
+    if tool_result.ok:
+        try:
+            actual_name, arguments = parse_tool_call_response(tool_result.data)
+            if actual_name != tool_name:
+                raise ValueError(f"expected {tool_name}, received {actual_name}")
+            sink.add(f"[PASS] tool call parsed: {actual_name} {arguments!r}")
+        except ValueError as exc:
+            sink.add(f"[FAIL] tool call parsed: {exc}")
+            ok = False
+    sink.add(f"Agent result: {'PASS' if ok else 'FAIL'}")
+    return ok, sink.lines
 
 
 def _median(values: list[float]) -> float | None:

@@ -67,6 +67,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn("--metrics", command)
         self.assertIn("--no-webui", command)
 
+    def test_parallel_slots_default_matches_llama_server_auto(self) -> None:
+        self.assertEqual(core.default_cli_flags()["-np"]["value"], "-1")
+
     def test_import_export_round_trip_and_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "presets.json"
@@ -96,6 +99,67 @@ class CoreTests(unittest.TestCase):
         })
         self.assertEqual(content, "hello world")
         self.assertEqual(tokens, 2)
+
+    def test_live_flag_discovery_is_version_cached(self) -> None:
+        core._SERVER_FLAG_CACHE.clear()
+        calls: list[list[str]] = []
+
+        def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(command)
+            if command[-1] == "--version":
+                return subprocess.CompletedProcess(command, 0, "version 42\n", "")
+            return subprocess.CompletedProcess(command, 0, "--alpha VALUE\n--beta, --no-beta\n", "")
+
+        with mock.patch("llamawrap_core.subprocess.run", side_effect=fake_run):
+            first = core.discover_server_flags("llama-server", ("--fallback",))
+            second = core.discover_server_flags("llama-server", ("--fallback",))
+
+        self.assertEqual(first, ("--alpha", "--beta", "--no-beta"))
+        self.assertEqual(second, first)
+        self.assertEqual(sum(call[-1] == "--help" for call in calls), 1)
+
+    def test_live_flag_discovery_falls_back_when_unavailable(self) -> None:
+        core._SERVER_FLAG_CACHE.clear()
+        with mock.patch("llamawrap_core.subprocess.run", side_effect=FileNotFoundError("missing")):
+            flags = core.discover_server_flags("missing-server", ("--zeta", "--alpha"))
+        self.assertEqual(flags, ("--alpha", "--zeta"))
+
+    def test_server_readiness_log_matching(self) -> None:
+        for line in ("main: model loaded", "Server is listening on 127.0.0.1", "all slots are idle"):
+            self.assertTrue(core.log_indicates_server_ready(line))
+        self.assertFalse(core.log_indicates_server_ready("loading model tensors"))
+
+    def test_agent_report_requires_a_parsed_tool_call(self) -> None:
+        def fake_http(method: str, url: str, payload: dict | None = None, timeout: float = 0) -> core.EndpointResult:
+            if url.endswith("/v1/models"):
+                return core.EndpointResult(True, 200, url, data={"data": [{"id": "demo"}]})
+            if url.endswith("/props"):
+                return core.EndpointResult(True, 200, url, data={"chat_template_caps": {
+                    "supports_tools": True,
+                    "supports_tool_calls": True,
+                }})
+            if url.endswith("/v1/responses"):
+                return core.EndpointResult(False, 404, url, error="not found")
+            self.assertEqual(payload["model"], "demo")
+            self.assertEqual(payload["tool_choice"]["function"]["name"], "llama_wrap_time_check")
+            return core.EndpointResult(True, 200, url, data={
+                "choices": [{"message": {"tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "llama_wrap_time_check", "arguments": '{"timezone":"UTC"}'},
+                }]}}],
+            })
+
+        with mock.patch("llamawrap_core.http_json", side_effect=fake_http):
+            ok, lines = core.agent_report(make_preset())
+        self.assertTrue(ok)
+        self.assertTrue(any("[WARN] /v1/responses" in line for line in lines))
+        self.assertTrue(any("tool call parsed" in line for line in lines))
+
+        bad = core.EndpointResult(True, 200, "url", data={"choices": [{"message": {"content": "UTC"}}]})
+        with mock.patch("llamawrap_core.http_json", return_value=bad):
+            ok, lines = core.agent_report(make_preset())
+        self.assertFalse(ok)
+        self.assertTrue(any("model returned no tool_calls" in line for line in lines))
 
     def test_http_json_success(self) -> None:
         with mock.patch("urllib.request.urlopen", return_value=FakeResponse(200, '{"ok": true}')):
@@ -471,10 +535,22 @@ class LocalOpenAIHandler(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok"})
         elif self.path == "/v1/models":
             self._json(200, {"data": [{"id": "local"}]})
+        elif self.path == "/props":
+            self._json(200, {"chat_template_caps": {
+                "supports_tools": True,
+                "supports_tool_calls": True,
+                "supports_parallel_tool_calls": False,
+            }})
         else:
             self._json(404, {"error": "not found"})
 
     def do_POST(self) -> None:
+        if self.path == "/v1/responses":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length:
+                self.rfile.read(length)
+            self._json(200, {"id": "resp_local", "output": [{"type": "message"}]})
+            return
         if self.path == "/tokenize":
             length = int(self.headers.get("Content-Length", "0") or "0")
             body = self.rfile.read(length).decode("utf-8") if length else "{}"
@@ -494,6 +570,15 @@ class LocalOpenAIHandler(BaseHTTPRequestHandler):
             payload = json.loads(body)
         except json.JSONDecodeError:
             payload = {}
+        if payload.get("tools"):
+            self._json(200, {
+                "choices": [{"message": {"tool_calls": [{
+                    "type": "function",
+                    "function": {"name": "llama_wrap_time_check", "arguments": '{"timezone":"UTC"}'},
+                }]}}],
+                "usage": {"completion_tokens": 8},
+            })
+            return
         if payload.get("stream"):
             chunks = [
                 {"choices": [{"delta": {"content": "OK"}}]},
@@ -579,6 +664,10 @@ class CliSmokeTests(unittest.TestCase):
             probe = self.run_cli(history, "probe", "Demo")
             self.assertEqual(probe.returncode, 0, probe.stderr + probe.stdout)
             self.assertIn("Probe result: PASS", probe.stdout)
+
+            agent = self.run_cli(history, "agent", "Demo")
+            self.assertEqual(agent.returncode, 0, agent.stderr + agent.stdout)
+            self.assertIn("Agent result: PASS", agent.stdout)
 
             bench_dir = temp / "bench"
             bench = self.run_cli(history, "bench", "Demo", "--csv", "--out-dir", str(bench_dir))

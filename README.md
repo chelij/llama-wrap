@@ -93,8 +93,8 @@ python llamawrap.py run "My Model"
 - **Presets**: save, load, rename, delete, create, and import launch configurations.
 - **Command import**: paste an existing `llama-server` command and turn it into a preset.
 - **Model selectors**: browse for model, MMProj, and draft `.gguf` files.
-- **Flag editing**: edit common flags, add custom flags, or pass advanced extra args.
-- **Diagnostics**: run Doctor, Probe, Bench, and Stress from the GUI or CLI.
+- **Flag editing**: edit common flags, add custom flags, or pass advanced extra args. The Add Flag picker reads the selected server's current `--help` output and falls back to bundled suggestions when discovery is unavailable.
+- **Diagnostics**: run Doctor, Probe, Agent, Bench, and Stress from the GUI or CLI.
 - **Benchmarks**: save local JSON results, with optional CSV output from the CLI.
 - **Context stress**: test large-context behavior with fill/decode stages, sustained synthetic coding-agent turns, and boundary probes.
 - **Auto-restart**: restart a server if it crashes.
@@ -163,6 +163,7 @@ These commands expect the configured endpoint to be running, except for the loca
 ```bash
 python llamawrap.py doctor "My Model"
 python llamawrap.py probe "My Model"
+python llamawrap.py agent "My Model"
 python llamawrap.py bench "My Model"
 python llamawrap.py stress "My Model"
 ```
@@ -240,6 +241,7 @@ llamawrap-cli create "My Model" /models/model.gguf --set -ngl all --set -c 32768
 llamawrap-cli import "My Model" llama-server -m /models/model.gguf -ngl all -c 32768
 llamawrap-cli doctor "My Model"
 llamawrap-cli probe "My Model"
+llamawrap-cli agent "My Model"
 llamawrap-cli bench "My Model" --csv
 llamawrap-cli stress "My Model"
 llamawrap-cli export-presets --out presets.json --portable
@@ -335,6 +337,7 @@ The GUI Diagnostics row runs these actions in the background and streams readabl
 
 - **Doctor**: checks executable/path setup, configured host/port, port availability, `/health`, `/v1/models`, and `/v1/chat/completions`.
 - **Probe**: sends one small OpenAI-compatible chat completion request.
+- **Agent**: reports chat-template capabilities, probes the optional `/v1/responses` API, and requires the model to return a valid OpenAI-style function tool call.
 - **Bench**: sends one controlled prompt, reports latency/token speed when available, and saves a JSON result locally.
 - **Stress**: detects effective runtime context, runs staged fill/decode requests, sustained synthetic coding-agent turns, boundary probes, and prints a practical working-limit summary.
 
