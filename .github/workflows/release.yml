@@ -10,7 +10,13 @@ permissions:
   contents: write
 
 jobs:
+  tests:
+    uses: ./.github/workflows/tests.yml
+    permissions:
+      contents: read
+
   build:
+    needs: tests
     name: Build ${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
     strategy:
