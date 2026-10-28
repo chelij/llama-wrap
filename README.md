@@ -6,6 +6,8 @@ It helps you build, import, save, run, diagnose, probe, benchmark, and stress-te
 
 It is not a chat UI, model downloader, or model manager.
 
+[Implementation case study](docs/case-study.md) · [Download releases](https://github.com/chelij/llama-wrap/releases) · [Automatic checks](https://github.com/chelij/llama-wrap/actions/workflows/tests.yml)
+
 ![llama-wrap screenshot](screenshot.png)
 
 ## Quick Start
@@ -353,6 +355,14 @@ Doctor: My Model
   /v1/models       PASS  model list returned
   chat completion  PASS  42 tokens/sec estimate available
 ```
+
+## Development checks
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+The suite uses synthetic inputs and a local HTTP fixture; no GGUF model or running inference server is required. Automatic checks run on pushes and pull requests, and gate release packaging. See the [case study](docs/case-study.md) for checked behavior and benchmark measurement limits.
 
 ## Requirements
 
